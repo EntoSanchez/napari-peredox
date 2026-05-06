@@ -123,25 +123,38 @@ pip install .   # torch from PyPI is CPU-only by default
 
 7. Click **💾 Export measurements CSV** to save a CSV and label TIFF to `annotations/results/`.
 
-### Batch workflow (ND2 files)
+### Batch workflow
 
-1. Open **Plugins → Peredox: Batch Process ND2 Files**.
+Open **Plugins → Peredox: Batch Process ND2 Files**. The batch widget supports two image sources — choose at the top of the panel.
 
-2. Add ND2 files (or a folder containing them) to the file list.
+#### Source A — ND2 Z-stack files (default)
 
-3. Fill in **Treatment**, **Cell line**, and **Replicate** metadata.
+Use this when starting from raw acquisition files.
 
-4. Configure channels and segmentation parameters (same options as single-image widget).
+1. Add ND2 files using **Add files…** or **Add folder…** (recursively finds all `.nd2` files in a folder).
+2. Fill in **Treatment**, **Cell line**, and **Replicate** metadata.
+3. Configure channels and segmentation parameters.
+4. Choose an **Output folder** and click **▶ Run batch**.
 
-5. Choose an **Output folder**.
+For each XY stage position in each ND2 file the plugin:
+- Max-projects the Z-stack → saves as `out_folder/mips/<stem>_<pos>_MIP.tif`
+- Segments parasites → saves mask as `out_folder/masks/<stem>_<pos>_mask.tif`
+- Measures fluorescence and appends to the in-memory results table
 
-6. Click **▶ Run batch**. For each XY stage position in each ND2 file the plugin:
-   - Max-projects the Z-stack
-   - Saves the MIP as `out_folder/mips/<stem>_<pos>_MIP.tif`
-   - Segments parasites and saves the mask as `out_folder/masks/<stem>_<pos>_mask.tif`
-   - Measures fluorescence
+#### Source B — TIFF folder (Max IPs)
 
-7. After the run, use the **Manual review** panel to open any position in the curation gallery, accept/reject individual parasites, then click **Save accepted results CSV** to write `out_folder/results.csv`.
+Use this when you already have max-intensity projection TIFFs — for example, MIPs exported from NIS-Elements, Fiji, or a previous batch run. Switch the **Source type** dropdown to **TIFF folder (Max IPs)**, then choose the folder containing your `.tif` / `.tiff` files. Each file is treated as one position; the file stem becomes the position name in the results CSV.
+
+Accepted TIFF layouts:
+- **(H, W)** — single channel, gains a dummy channel axis automatically
+- **(C, H, W)** — ImageJ/Fiji convention (first axis ≤ 16 assumed to be channels)
+- **(H, W, C)** — already in pipeline format
+
+Pixel size is read from the TIFF metadata if present (OME-TIFF `PhysicalSizeX` or standard `XResolution` tag); otherwise enter it manually in the **Pixel size** field.
+
+#### After either batch run
+
+Use the **Manual review** panel to open any position in the curation gallery, accept/reject individual parasites, then click **Save accepted results CSV** to write `out_folder/results.csv`. Positions you have not reviewed default to keeping all detected parasites.
 
 ---
 
@@ -162,6 +175,11 @@ pip install .   # torch from PyPI is CPU-only by default
 | **Group into vacuoles** | on | Clusters nearby parasites; reports one per vacuole |
 | **Dilation (px)** | 5 | Expansion radius used when grouping parasites |
 | **Select parasite by** | largest | Which parasite represents the vacuole: `largest`, `highest_ratio`, `median_ratio` |
+
+**Recommended settings for Peredox experiments:**
+
+- **Intensity threshold → percentile** (50–75): set the threshold channel to cpTSapphire (usually ch 0). This zeros out dim autofluorescent background before Cellpose-SAM runs, which substantially reduces false-positive detections in cells with no parasites. Start at the 50th percentile (median of non-zero pixels) and increase if too many background objects are still being segmented.
+- **Select parasite by → median_ratio**: within each vacuole, picks the parasite whose cpTSapphire/mCherry ratio is closest to the group median rather than the largest or brightest parasite. This is more robust to outliers caused by parasites at the edge of the focal plane.
 
 ---
 
