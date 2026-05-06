@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# napari-peredox — user data (never commit annotations or trained models)
+annotations/curated_features.csv
+annotations/curated_features.joblib
+annotations/results/
+
+# Windows launcher (hardcodes user-specific paths)
+launch_napari.bat
+
+# Windows system files
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Distribution artifacts
+*.whl
+*.tar.gz

@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-peredox"
+version = "0.1.0"
+description = "napari plugin for parasitophorous vacuole segmentation and Peredox ratiometric measurements"
+requires-python = ">=3.11"
+dependencies = [
+  "napari[all]>=0.5.0",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "qtpy>=2.4",
+  "tifffile>=2023.9.26",
+  "scikit-image>=0.22",
+  "scikit-learn>=1.4",
+  "joblib>=1.5.3",
+  "nd2>=0.11.3",
+  "cellpose>=4.1.1",
+  "torch",
+  "torchvision",
+]
+
+[project.entry-points."napari.manifest"]
+napari-peredox = "napari_peredox:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["napari_peredox*"]
+
+[tool.setuptools.package-data]
+napari_peredox = ["napari.yaml"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["F", "E", "W", "UP", "I"]
+ignore = ["E501"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.11",
+]

@@ -1,0 +1,20 @@
+name: napari-peredox
+display_name: Peredox PV Analyzer
+contributions:
+  commands:
+    - id: napari-peredox.make_main_widget
+      python_name: napari_peredox._widget:PeredoxWidget
+      title: "Peredox: Segment & Measure PVs"
+    - id: napari-peredox.make_curation_widget
+      python_name: napari_peredox._curation:make_curation_widget
+      title: "Peredox: Curate PV Segments"
+    - id: napari-peredox.make_batch_widget
+      python_name: napari_peredox._batch:make_batch_widget
+      title: "Peredox: Batch Process ND2 Files"
+  widgets:
+    - command: napari-peredox.make_main_widget
+      display_name: "Peredox: Segment & Measure PVs"
+    - command: napari-peredox.make_curation_widget
+      display_name: "Peredox: Curate PV Segments"
+    - command: napari-peredox.make_batch_widget
+      display_name: "Peredox: Batch Process ND2 Files"
