@@ -21,12 +21,12 @@ Accepted/rejected decisions are written back to the main widget's
 
 Split workflow
 --------------
-Click '✂ Split segment' to enter split mode.  The thumbnail becomes
-interactive: each left-click places a seed (yellow dot) at a parasite
-centre.  Click at least two seeds — one inside each parasite body — then
-click 'Apply split'.  Watershed runs from the seeds, the merged mask is
-replaced with individual parasite masks, and measurements are updated.
-'Cancel' discards all seeds and exits split mode.
+Click '✂ Split segment' to enter draw mode.  Click and drag a line
+across the boundary between the two merged parasites — an orange stroke
+appears in real time.  Click 'Apply split': the drawn line is removed
+from the mask and connected-component labelling separates the two
+pieces into independent segments.  Tiny fragments along the cut are
+absorbed into the nearest large piece.  'Cancel' discards the stroke.
 """
 
 from __future__ import annotations
@@ -49,8 +49,6 @@ from qtpy.QtWidgets import (
 if TYPE_CHECKING:
     import pandas as pd
 
-# Dot radius (pixels in thumbnail space) drawn for each seed
-_SEED_DOT_RADIUS = 5
 # Display size passed to _array_to_pixmap
 _THUMB_DISPLAY = 230
 # Fixed size of the QLabel containing the thumbnail
@@ -132,18 +130,45 @@ def _make_thumbnail(
     return (rgb * 255).clip(0, 255).astype(np.uint8), (y0, x0, y1, x1)
 
 
+def _bresenham(r0: int, c0: int, r1: int, c1: int) -> list[tuple[int, int]]:
+    """Integer pixel positions on the line from (r0, c0) to (r1, c1)."""
+    pts: list[tuple[int, int]] = []
+    dr, dc = abs(r1 - r0), abs(c1 - c0)
+    sr = 1 if r0 < r1 else -1
+    sc = 1 if c0 < c1 else -1
+    err = dr - dc
+    while True:
+        pts.append((r0, c0))
+        if r0 == r1 and c0 == c1:
+            break
+        e2 = 2 * err
+        if e2 > -dc:
+            err -= dc
+            r0 += sr
+        if e2 < dr:
+            err += dr
+            c0 += sc
+    return pts
+
+
 class _ClickableThumbnail(QLabel):
     """
-    QLabel subclass that emits the widget-space (x, y) of each left-click.
-    Used in split mode to let the user place parasite-centre seeds.
+    QLabel that emits click and drag positions for the split draw tool.
+    In draw mode the user click-drags a line across a merged segment.
     """
 
     clicked_at = Signal(int, int)
+    dragged_to = Signal(int, int)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked_at.emit(event.x(), event.y())
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.dragged_to.emit(event.x(), event.y())
+        super().mouseMoveEvent(event)
 
 
 class CurationWidget(QWidget):
@@ -208,11 +233,11 @@ class CurationWidget(QWidget):
 
         # ── Split-mode state ──────────────────────────────────────────────────
         self._split_mode: bool = False
-        # Seeds placed by the user: list of (row, col) in full image coordinates
-        self._split_seeds: list[tuple[int, int]] = []
+        # Freehand stroke drawn by the user (thumbnail QLabel coords)
+        self._stroke_points: list[tuple[int, int]] = []
         # Crop coords for the currently displayed thumbnail
         self._thumb_crop: tuple[int, int, int, int] | None = None
-        # Raw RGB thumbnail (before seed overlay)
+        # Raw RGB thumbnail (before stroke overlay)
         self._thumb_raw: np.ndarray | None = None
 
         self._build_ui()
@@ -246,6 +271,7 @@ class CurationWidget(QWidget):
         self._thumbnail_label.setFixedSize(_LABEL_SIZE, _LABEL_SIZE)
         self._thumbnail_label.setStyleSheet("background-color: black;")
         self._thumbnail_label.clicked_at.connect(self._on_thumbnail_clicked)
+        self._thumbnail_label.dragged_to.connect(self._on_stroke_drag)
         layout.addWidget(self._thumbnail_label, alignment=Qt.AlignHCenter)
 
         # Measurement info
@@ -286,8 +312,8 @@ class CurationWidget(QWidget):
         # ── Split section ─────────────────────────────────────────────────────
         self._btn_split_toggle = QPushButton("✂  Split segment")
         self._btn_split_toggle.setToolTip(
-            "Enter split mode: click inside the thumbnail to mark each\n"
-            "parasite centre, then click 'Apply split'."
+            "Enter draw mode: click and drag a line across the merged\n"
+            "parasites to cut them apart, then click 'Apply split'."
         )
         self._btn_split_toggle.clicked.connect(self._toggle_split_mode)
         layout.addWidget(self._btn_split_toggle)
@@ -298,7 +324,9 @@ class CurationWidget(QWidget):
         split_layout.setContentsMargins(0, 0, 0, 0)
         split_layout.setSpacing(4)
 
-        self._split_info = QLabel("Click each parasite centre — need ≥ 2 points.")
+        self._split_info = QLabel(
+            "Click and drag across the two parasites to draw the cut line."
+        )
         self._split_info.setAlignment(Qt.AlignCenter)
         self._split_info.setStyleSheet("color: #e6ac00; font-style: italic;")
         self._split_info.setWordWrap(True)
@@ -382,135 +410,156 @@ class CurationWidget(QWidget):
             self._cancel_split()
         else:
             self._split_mode = True
-            self._split_seeds = []
+            self._stroke_points = []
             self._split_panel.setVisible(True)
-            self._btn_split_toggle.setText("✂  (split mode ON — click thumbnail)")
+            self._btn_split_toggle.setText("✂  (draw mode ON — drag across segment)")
             self._btn_split_toggle.setStyleSheet("color: #e6ac00; font-weight: bold;")
             self._thumbnail_label.setCursor(Qt.CrossCursor)
-            self._split_info.setText("Click each parasite centre — need ≥ 2 points.")
+            self._split_info.setText(
+                "Click and drag across the two parasites to draw the cut line."
+            )
 
     def _cancel_split(self):
         if not self._split_mode:
             return
         self._split_mode = False
-        self._split_seeds = []
+        self._stroke_points = []
         self._split_panel.setVisible(False)
         self._btn_split_toggle.setText("✂  Split segment")
         self._btn_split_toggle.setStyleSheet("")
         self._thumbnail_label.setCursor(Qt.ArrowCursor)
-        # Redraw thumbnail without dots
         if self._thumb_raw is not None:
             self._thumbnail_label.setPixmap(
                 _array_to_pixmap(self._thumb_raw, _THUMB_DISPLAY)
             )
 
     def _on_thumbnail_clicked(self, wx: int, wy: int):
-        """Convert a thumbnail click to image coordinates and add a seed."""
+        """Start a new draw stroke (resets any previous stroke)."""
         if not self._split_mode or self._thumb_crop is None or not self._label_ids:
             return
-
-        y0, x0, y1, x1 = self._thumb_crop
-        crop_h, crop_w = y1 - y0, x1 - x0
-        if crop_h <= 0 or crop_w <= 0:
-            return
-
-        # Compute the scale used by _array_to_pixmap
-        scale = min(_THUMB_DISPLAY / crop_h, _THUMB_DISPLAY / crop_w)
-        pix_h = int(crop_h * scale)
-        pix_w = int(crop_w * scale)
-
-        # Pixmap is centered inside the _LABEL_SIZE × _LABEL_SIZE QLabel
-        off_x = (_LABEL_SIZE - pix_w) / 2
-        off_y = (_LABEL_SIZE - pix_h) / 2
-
-        # Map click → image coordinates
-        img_col = int((wx - off_x) / scale) + x0
-        img_row = int((wy - off_y) / scale) + y0
-
-        # Clamp to valid range
-        img_row = max(y0, min(y1 - 1, img_row))
-        img_col = max(x0, min(x1 - 1, img_col))
-
-        # Only accept clicks inside the current segment's mask
-        lid = self._label_ids[self._current_idx]
-        if self._labels[img_row, img_col] != lid:
-            self._split_info.setText(
-                f"Click landed outside segment {lid} — click inside the white outline."
-            )
-            return
-
-        self._split_seeds.append((img_row, img_col))
-        n = len(self._split_seeds)
-        self._split_info.setText(
-            f"{n} point(s) placed."
-            + (" Ready — click 'Apply split'." if n >= 2 else " Need ≥ 2.")
-        )
+        self._stroke_points = [(wx, wy)]
+        self._split_info.setText("Drag to draw the cut line…")
         self._redraw_thumbnail()
 
+    def _on_stroke_drag(self, wx: int, wy: int):
+        """Extend the current stroke while the mouse button is held."""
+        if not self._split_mode or not self._stroke_points:
+            return
+        self._stroke_points.append((wx, wy))
+        self._redraw_thumbnail()
+        n = len(self._stroke_points)
+        self._split_info.setText(
+            f"Drawing… {n} points. Release mouse, then click 'Apply split'."
+        )
+
     def _redraw_thumbnail(self):
-        """Redraw thumbnail overlaying yellow seed dots at current split seeds."""
+        """Redraw thumbnail with the current cut stroke overlaid in orange."""
         if self._thumb_raw is None or self._thumb_crop is None:
             return
 
-        y0, x0, y1, x1 = self._thumb_crop
-        crop_h, crop_w = y1 - y0, x1 - x0
-        if crop_h <= 0 or crop_w <= 0:
-            return
-
-        scale = min(_THUMB_DISPLAY / crop_h, _THUMB_DISPLAY / crop_w)
-
         rgb = self._thumb_raw.copy()
-        for seed_row, seed_col in self._split_seeds:
-            # Convert image coord → thumbnail pixel coord
-            tr = int((seed_row - y0) * scale)
-            tc = int((seed_col - x0) * scale)
-            r = _SEED_DOT_RADIUS
-            for dr in range(-r, r + 1):
-                for dc in range(-r, r + 1):
-                    if dr * dr + dc * dc <= r * r:
-                        nr, nc = tr + dr, tc + dc
-                        if 0 <= nr < rgb.shape[0] and 0 <= nc < rgb.shape[1]:
-                            rgb[nr, nc] = [255, 220, 0]  # yellow
+        half = 2  # stroke half-width in thumbnail pixels (5 px total)
+        for wx, wy in self._stroke_points:
+            for dr in range(-half, half + 1):
+                for dc in range(-half, half + 1):
+                    nr, nc = wy + dr, wx + dc
+                    if 0 <= nr < rgb.shape[0] and 0 <= nc < rgb.shape[1]:
+                        rgb[nr, nc] = [255, 140, 0]  # orange
 
         self._thumbnail_label.setPixmap(_array_to_pixmap(rgb, _THUMB_DISPLAY))
 
     def _apply_split(self):
-        """Run watershed from the placed seeds and replace the merged segment."""
-        if len(self._split_seeds) < 2:
-            self._split_info.setText("Need at least 2 seed points before splitting.")
+        """Cut the segment along the drawn stroke using connected components."""
+        if len(self._stroke_points) < 2:
+            self._split_info.setText("Draw a line across the merged parasites first.")
             return
         if not self._label_ids:
             return
 
-        from skimage.segmentation import watershed
+        from scipy.ndimage import distance_transform_edt
+        from scipy.ndimage import label as ndlabel
 
         lid = self._label_ids[self._current_idx]
         mask = self._labels == lid
 
-        # Build seed image — one integer per seed point
-        seeds = np.zeros_like(self._labels, dtype=np.int32)
-        for k, (r, c) in enumerate(self._split_seeds, start=1):
-            seeds[r, c] = k
+        # ── Convert stroke from thumbnail → image coordinates ─────────────────
+        y0, x0, y1, x1 = self._thumb_crop
+        crop_h, crop_w = y1 - y0, x1 - x0
+        if crop_h <= 0 or crop_w <= 0:
+            return
 
-        # Pure geodesic Voronoi: each pixel goes to the nearest seed by BFS
-        # within the mask.  This places the split boundary exactly along the
-        # perpendicular bisector of the line between the two seeds (within the
-        # mask shape), which matches where the user intuitively expects the cut.
-        split_result = watershed(
-            np.zeros(mask.shape, dtype=np.float64), markers=seeds, mask=mask
-        )
+        scale = min(_THUMB_DISPLAY / crop_h, _THUMB_DISPLAY / crop_w)
+        pix_h = int(crop_h * scale)
+        pix_w = int(crop_w * scale)
+        off_x = (_LABEL_SIZE - pix_w) / 2
+        off_y = (_LABEL_SIZE - pix_h) / 2
 
-        # Assign new label IDs for each split piece
+        def _thumb_to_img(wx: int, wy: int) -> tuple[int, int]:
+            ir = int((wy - off_y) / scale) + y0
+            ic = int((wx - off_x) / scale) + x0
+            return (
+                max(0, min(self._labels.shape[0] - 1, ir)),
+                max(0, min(self._labels.shape[1] - 1, ic)),
+            )
+
+        # Interpolate between consecutive stroke points so there are no gaps
+        cut_pixels: set[tuple[int, int]] = set()
+        prev = _thumb_to_img(*self._stroke_points[0])
+        for wx, wy in self._stroke_points[1:]:
+            cur = _thumb_to_img(wx, wy)
+            for pt in _bresenham(prev[0], prev[1], cur[0], cur[1]):
+                cut_pixels.add(pt)
+            prev = cur
+
+        # ── Remove cut pixels and find connected components ───────────────────
+        temp_mask = mask.copy()
+        for r, c in cut_pixels:
+            if mask[r, c]:
+                temp_mask[r, c] = False
+
+        labeled_comp, n_comp = ndlabel(temp_mask)
+
+        if n_comp < 2:
+            self._split_info.setText(
+                "Line didn't fully cross the segment — draw all the way through."
+            )
+            return
+
+        # ── Merge tiny fragments into the nearest large component ─────────────
+        mask_area = int(mask.sum())
+        threshold = max(5, mask_area // 100)  # ignore fragments < 1% of mask
+        comp_sizes = {k: int((labeled_comp == k).sum()) for k in range(1, n_comp + 1)}
+        large = [k for k, s in comp_sizes.items() if s >= threshold]
+        if len(large) < 2:
+            self._split_info.setText(
+                "Cut produced only one significant region — draw further across."
+            )
+            return
+
+        # Build final label image: large components stay; unassigned pixels
+        # (small fragments + cut pixels within mask) go to nearest large component.
+        final = np.zeros_like(labeled_comp)
+        for k in large:
+            final[labeled_comp == k] = k
+
+        unassigned = mask & (final == 0)
+        if unassigned.any():
+            _, (nr_arr, nc_arr) = distance_transform_edt(
+                final == 0, return_indices=True
+            )
+            final[unassigned] = final[nr_arr[unassigned], nc_arr[unassigned]]
+
+        final[~mask] = 0
+        unique_ids = [u for u in np.unique(final) if u != 0]
+
+        # ── Assign new label IDs ──────────────────────────────────────────────
         current_max = int(self._labels.max())
         new_label_ids: list[int] = []
-        for seg_id in sorted(np.unique(split_result)):
-            if seg_id == 0:
-                continue
+        for seg_id in unique_ids:
             current_max += 1
-            self._labels[split_result == seg_id] = current_max
+            self._labels[final == seg_id] = current_max
             new_label_ids.append(current_max)
 
-        # The original label pixels have all been overwritten above.
         # Update label_ids list: remove old, insert new at same position.
         insert_pos = self._current_idx
         self._label_ids.pop(insert_pos)
