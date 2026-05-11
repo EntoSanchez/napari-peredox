@@ -167,6 +167,7 @@ class CurationWidget(QWidget):
         ch_mcherry: int,
         ch_names: dict[int, str] | None = None,
         pixel_size_um: float | None = None,
+        vacuole_assignments: dict[int, int] | None = None,
         on_save: Callable | None = None,
         parent=None,
     ):
@@ -198,6 +199,12 @@ class CurationWidget(QWidget):
             self._vacuole_assignments = {
                 lid: i + 1 for i, lid in enumerate(self._label_ids)
             }
+
+        # If the caller passes the full label→vacuole map (e.g. from batch mode
+        # where select_one_per_vacuole has reduced measurements to representatives
+        # only), use it so that all siblings are visible in the thumbnail.
+        if vacuole_assignments is not None:
+            self._vacuole_assignments = dict(vacuole_assignments)
 
         # ── Split-mode state ──────────────────────────────────────────────────
         self._split_mode: bool = False
@@ -475,7 +482,6 @@ class CurationWidget(QWidget):
         if not self._label_ids:
             return
 
-        from scipy.ndimage import distance_transform_edt
         from skimage.segmentation import watershed
 
         lid = self._label_ids[self._current_idx]
@@ -486,9 +492,13 @@ class CurationWidget(QWidget):
         for k, (r, c) in enumerate(self._split_seeds, start=1):
             seeds[r, c] = k
 
-        # Distance-transform watershed seeded by user points
-        dist = distance_transform_edt(mask).astype(np.float64)
-        split_result = watershed(-dist, markers=seeds, mask=mask)
+        # Pure geodesic Voronoi: each pixel goes to the nearest seed by BFS
+        # within the mask.  This places the split boundary exactly along the
+        # perpendicular bisector of the line between the two seeds (within the
+        # mask shape), which matches where the user intuitively expects the cut.
+        split_result = watershed(
+            np.zeros(mask.shape, dtype=np.float64), markers=seeds, mask=mask
+        )
 
         # Assign new label IDs for each split piece
         current_max = int(self._labels.max())
@@ -573,12 +583,15 @@ class CurationWidget(QWidget):
         self._lbl_nav.setText(f"Parasite {idx + 1} / {n}  (id={lid})")
 
         # Find sibling parasites sharing the same vacuole so they appear as
-        # cyan outlines in the thumbnail for context
+        # cyan outlines in the thumbnail for context.  Search all entries in
+        # _vacuole_assignments (not just _label_ids) so that in batch mode,
+        # where select_one_per_vacuole removes non-representative parasites from
+        # measurements, the full vacuole mask is still shown.
         current_vac = self._vacuole_assignments.get(lid)
         siblings = [
             other
-            for other in self._label_ids
-            if other != lid and self._vacuole_assignments.get(other) == current_vac
+            for other, vac in self._vacuole_assignments.items()
+            if other != lid and vac == current_vac
         ]
 
         # Generate thumbnail and store crop coords for split-mode coordinate mapping
@@ -604,7 +617,10 @@ class CurationWidget(QWidget):
             area = int(row.get("area_px", 0))
             ratio = row.get("ratio_cptsa_mcherry", float("nan"))
             ratio_str = f"{ratio:.3f}" if not np.isnan(ratio) else "—"
-            n_in_vac = int(row.get("parasites_per_vacuole", 1))
+            try:
+                n_in_vac = int(row.get("parasites_per_vacuole", 1))
+            except (ValueError, TypeError):
+                n_in_vac = 1
             decision = {1: "✓ Accepted", 0: "✗ Rejected", -1: "Pending"}[
                 self._decisions[lid]
             ]

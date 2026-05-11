@@ -65,8 +65,8 @@ class _SegmentWorker(QObject):
     """
 
     finished = Signal(
-        object, object, object, object, object
-    )  # raw_labels, labels, vac_img, features, measurements
+        object, object, object, object, object, object
+    )  # raw_labels, labels, vac_img, features, measurements, vac_map
     error = Signal(str)
     progress = Signal(str)
 
@@ -220,6 +220,7 @@ class _SegmentWorker(QObject):
 
             # ---- vacuole grouping: select one parasite per vacuole ----
             vac_img = None
+            vacuole_map: dict = {}
             if group_vacuoles and not measurements.empty:
                 self.progress.emit("Grouping parasites into vacuoles…")
                 from ._segment import vacuole_label_image
@@ -235,7 +236,9 @@ class _SegmentWorker(QObject):
                     f"one representative parasite each ({vacuole_method})."
                 )
 
-            self.finished.emit(raw_labels, labels, vac_img, features, measurements)
+            self.finished.emit(
+                raw_labels, labels, vac_img, features, measurements, vacuole_map
+            )
 
         except Exception:
             import traceback
@@ -260,6 +263,7 @@ class PeredoxWidget(QWidget):
         self._labels: np.ndarray | None = None
         self._features = None  # pd.DataFrame
         self._measurements = None  # pd.DataFrame
+        self._vac_map: dict = {}  # full label→vacuole_id map from group_by_vacuole
         self._classifier = None  # fitted sklearn pipeline or None
         self._image_stem: str = "image"
 
@@ -818,12 +822,13 @@ class PeredoxWidget(QWidget):
         self._thread.start()
 
     def _on_segmentation_done(
-        self, raw_labels, labels, vac_img, features, measurements
+        self, raw_labels, labels, vac_img, features, measurements, vac_map
     ):
         """Called in the main thread when the worker finishes successfully."""
         self._labels = labels
         self._features = features
         self._measurements = measurements
+        self._vac_map: dict = vac_map
 
         stem = self._image_stem
 
@@ -943,6 +948,7 @@ class PeredoxWidget(QWidget):
             ch_mcherry=self._ch_mcherry.value(),
             ch_names=ch_names,
             pixel_size_um=px if px > 0 else None,
+            vacuole_assignments=self._vac_map if self._vac_map else None,
             on_save=self._on_curation_saved,
             parent=None,
         )

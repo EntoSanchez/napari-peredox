@@ -647,6 +647,7 @@ class _BatchWorker(QObject):
                     continue
 
                 # ── Group by vacuole, select one parasite each ────────────────
+                vac_map: dict[int, int] = {}
                 if p.get("group_vacuoles", True) and not meas.empty:
                     vac_map = group_by_vacuole(
                         labels, dilation_px=p.get("dilation_px", 5)
@@ -664,6 +665,10 @@ class _BatchWorker(QObject):
                         "image": image,
                         "labels": labels,
                         "measurements": meas.copy(),
+                        # Full label→vacuole map so CurationWidget can show all
+                        # siblings in a vacuole even when measurements only has
+                        # the representative parasite for each vacuole.
+                        "vac_map": vac_map,
                     }
                 )
 
@@ -1506,6 +1511,7 @@ class BatchWidget(QWidget):
             ch_mcherry=self._ch_mcherry.value(),
             ch_names=ch_names,
             pixel_size_um=px if px > 0 else None,
+            vacuole_assignments=data.get("vac_map") or None,
             on_save=_on_save,
         )
         curation.setWindowTitle(f"Curation — {data['display_name']}")
