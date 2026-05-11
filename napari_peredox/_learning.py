@@ -19,7 +19,7 @@ How it works end-to-end:
 
 The model is intentionally simple (RandomForest on hand-crafted features) so
 that:
-  - Training is instant (<1 s) even for hundreds of examples
+  - Training takes < 10 s even for thousands of examples
   - No GPU is required
   - Feature importances are human-inspectable
   - It starts working with as few as 10 annotated examples
@@ -217,16 +217,26 @@ def train_classifier(csv_path: str | Path) -> object | None:
     # StandardScaler ensures features on different scales (area vs. ratio)
     # don't dominate the RandomForest splits.
     # class_weight='balanced' compensates for imbalanced accept/reject counts.
+    #
+    # Hyperparameters scale with dataset size:
+    #   n_estimators=500     — more trees → lower variance; ~5 s on 9k rows
+    #   max_depth=None       — no depth cap; min_samples_leaf handles overfitting
+    #   min_samples_leaf=5   — each leaf must cover ≥5 examples (regularisation)
+    # For very small datasets (< ~100 rows) these are slightly over-powered but
+    # still correct; the depth limit in older versions was only necessary to
+    # prevent overfitting in the cold-start regime.
     clf = Pipeline(
         [
             ("scaler", StandardScaler()),
             (
                 "rf",
                 RandomForestClassifier(
-                    n_estimators=100,  # 100 trees — fast to train, stable predictions
-                    max_depth=8,  # limit depth to reduce overfitting on small data
-                    class_weight="balanced",  # weight minority class up
-                    random_state=42,  # reproducible results
+                    n_estimators=500,
+                    max_depth=None,
+                    min_samples_leaf=5,
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,  # use all CPU cores
                 ),
             ),
         ]
