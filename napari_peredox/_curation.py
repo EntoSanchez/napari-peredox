@@ -71,14 +71,17 @@ def _make_thumbnail(
     label_id: int,
     ch_cptsa: int,
     ch_mcherry: int,
+    sibling_label_ids: list[int] | None = None,
     pad: int = 20,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     """
-    Crop a padded bounding box around label_id and return an RGB (H, W, 3)
-    uint8 array plus the crop coordinates (y0, x0, y1, x1).
+    Crop a bounding box around label_id (and any sibling parasites sharing
+    the same vacuole) and return an RGB (H, W, 3) uint8 array plus the crop
+    coordinates (y0, x0, y1, x1).
 
     Green channel = cpTSapphire, Red channel = mCherry, Blue = 0.
-    The mask boundary is drawn in white.
+    Selected parasite boundary → white.
+    Sibling parasite boundaries → cyan, so the whole vacuole context is visible.
     """
     from skimage.segmentation import find_boundaries
 
@@ -86,10 +89,18 @@ def _make_thumbnail(
     if len(ys) == 0:
         return np.zeros((64, 64, 3), dtype=np.uint8), (0, 0, 64, 64)
 
-    y0 = max(int(ys.min()) - pad, 0)
-    y1 = min(int(ys.max()) + pad + 1, labels.shape[0])
-    x0 = max(int(xs.min()) - pad, 0)
-    x1 = min(int(xs.max()) + pad + 1, labels.shape[1])
+    # Expand the bounding box to include all sibling parasites in this vacuole
+    all_ys, all_xs = ys, xs
+    for sib_id in sibling_label_ids or []:
+        sib_ys, sib_xs = np.where(labels == sib_id)
+        if len(sib_ys):
+            all_ys = np.concatenate([all_ys, sib_ys])
+            all_xs = np.concatenate([all_xs, sib_xs])
+
+    y0 = max(int(all_ys.min()) - pad, 0)
+    y1 = min(int(all_ys.max()) + pad + 1, labels.shape[0])
+    x0 = max(int(all_xs.min()) - pad, 0)
+    x1 = min(int(all_xs.max()) + pad + 1, labels.shape[1])
 
     if image.ndim == 2:
         image = image[..., np.newaxis]
@@ -109,9 +120,14 @@ def _make_thumbnail(
 
     rgb = np.stack([red, green, blue], axis=-1)
 
+    # Draw sibling outlines in cyan first, then selected outline in white on top
+    for sib_id in sibling_label_ids or []:
+        sib_mask = labels[y0:y1, x0:x1] == sib_id
+        if sib_mask.any():
+            rgb[find_boundaries(sib_mask, mode="outer")] = [0.0, 0.75, 1.0]
+
     mask_crop = labels[y0:y1, x0:x1] == label_id
-    boundary = find_boundaries(mask_crop, mode="outer")
-    rgb[boundary] = [1.0, 1.0, 1.0]
+    rgb[find_boundaries(mask_crop, mode="outer")] = [1.0, 1.0, 1.0]
 
     return (rgb * 255).clip(0, 255).astype(np.uint8), (y0, x0, y1, x1)
 
@@ -556,9 +572,23 @@ class CurationWidget(QWidget):
         lid = self._label_ids[idx]
         self._lbl_nav.setText(f"Parasite {idx + 1} / {n}  (id={lid})")
 
+        # Find sibling parasites sharing the same vacuole so they appear as
+        # cyan outlines in the thumbnail for context
+        current_vac = self._vacuole_assignments.get(lid)
+        siblings = [
+            other
+            for other in self._label_ids
+            if other != lid and self._vacuole_assignments.get(other) == current_vac
+        ]
+
         # Generate thumbnail and store crop coords for split-mode coordinate mapping
         thumb, crop = _make_thumbnail(
-            self._image, self._labels, lid, self._ch_cptsa, self._ch_mcherry
+            self._image,
+            self._labels,
+            lid,
+            self._ch_cptsa,
+            self._ch_mcherry,
+            sibling_label_ids=siblings,
         )
         self._thumb_raw = thumb
         self._thumb_crop = crop
