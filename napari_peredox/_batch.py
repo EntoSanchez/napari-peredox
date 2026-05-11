@@ -1492,12 +1492,20 @@ class BatchWidget(QWidget):
                 self._log_msg(f"Classifier training skipped: {exc}")
             self._try_load_classifier()
 
+        ch_names = {
+            self._ch_cptsa.value(): "cptsa",
+            self._ch_mcherry.value(): "mcherry",
+        }
+        px = self._pixel_size.value()
+
         curation = CurationWidget(
             labels=data["labels"],
             image=data["image"],
             measurements=data["measurements"],
             ch_cptsa=self._ch_cptsa.value(),
             ch_mcherry=self._ch_mcherry.value(),
+            ch_names=ch_names,
+            pixel_size_um=px if px > 0 else None,
             on_save=_on_save,
         )
         curation.setWindowTitle(f"Curation — {data['display_name']}")

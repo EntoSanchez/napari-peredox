@@ -6,16 +6,27 @@ UI layout
 ---------
   [← Prev]  PV 3 / 12   [Next →]
   ┌────────────────────────────┐
-  │   thumbnail (cpTSa + merge)│
+  │   thumbnail (cpTSa + merge)│   ← click here to place split seeds
   └────────────────────────────┘
   Area: 1 234 px   Ratio: 1.42
+  Vacuole ID: [5]
   [✓ Accept]   [✗ Reject]   [Skip]
+  [✂ Split segment]
   ──────────────────────────────
   Status: 7 accepted, 3 rejected, 2 pending
   [Save & retrain classifier]
 
 Accepted/rejected decisions are written back to the main widget's
 `_curation_state` dict so that _io.py can persist them.
+
+Split workflow
+--------------
+Click '✂ Split segment' to enter split mode.  The thumbnail becomes
+interactive: each left-click places a seed (yellow dot) at a parasite
+centre.  Click at least two seeds — one inside each parasite body — then
+click 'Apply split'.  Watershed runs from the seeds, the merged mask is
+replaced with individual parasite masks, and measurements are updated.
+'Cancel' discards all seeds and exits split mode.
 """
 
 from __future__ import annotations
@@ -38,6 +49,13 @@ from qtpy.QtWidgets import (
 if TYPE_CHECKING:
     import pandas as pd
 
+# Dot radius (pixels in thumbnail space) drawn for each seed
+_SEED_DOT_RADIUS = 5
+# Display size passed to _array_to_pixmap
+_THUMB_DISPLAY = 230
+# Fixed size of the QLabel containing the thumbnail
+_LABEL_SIZE = 240
+
 
 def _array_to_pixmap(rgb: np.ndarray, size: int = 220) -> QPixmap:
     """Convert an (H, W, 3) uint8 array to a scaled QPixmap."""
@@ -54,9 +72,11 @@ def _make_thumbnail(
     ch_cptsa: int,
     ch_mcherry: int,
     pad: int = 20,
-) -> np.ndarray:
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     """
-    Crop a padded bounding box around label_id and return an RGB (H, W, 3) uint8.
+    Crop a padded bounding box around label_id and return an RGB (H, W, 3)
+    uint8 array plus the crop coordinates (y0, x0, y1, x1).
+
     Green channel = cpTSapphire, Red channel = mCherry, Blue = 0.
     The mask boundary is drawn in white.
     """
@@ -64,10 +84,12 @@ def _make_thumbnail(
 
     ys, xs = np.where(labels == label_id)
     if len(ys) == 0:
-        return np.zeros((64, 64, 3), dtype=np.uint8)
+        return np.zeros((64, 64, 3), dtype=np.uint8), (0, 0, 64, 64)
 
-    y0, y1 = max(ys.min() - pad, 0), min(ys.max() + pad + 1, labels.shape[0])
-    x0, x1 = max(xs.min() - pad, 0), min(xs.max() + pad + 1, labels.shape[1])
+    y0 = max(int(ys.min()) - pad, 0)
+    y1 = min(int(ys.max()) + pad + 1, labels.shape[0])
+    x0 = max(int(xs.min()) - pad, 0)
+    x1 = min(int(xs.max()) + pad + 1, labels.shape[1])
 
     if image.ndim == 2:
         image = image[..., np.newaxis]
@@ -87,17 +109,31 @@ def _make_thumbnail(
 
     rgb = np.stack([red, green, blue], axis=-1)
 
-    # Overlay mask boundary in white
     mask_crop = labels[y0:y1, x0:x1] == label_id
     boundary = find_boundaries(mask_crop, mode="outer")
     rgb[boundary] = [1.0, 1.0, 1.0]
 
-    return (rgb * 255).clip(0, 255).astype(np.uint8)
+    return (rgb * 255).clip(0, 255).astype(np.uint8), (y0, x0, y1, x1)
+
+
+class _ClickableThumbnail(QLabel):
+    """
+    QLabel subclass that emits the widget-space (x, y) of each left-click.
+    Used in split mode to let the user place parasite-centre seeds.
+    """
+
+    clicked_at = Signal(int, int)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked_at.emit(event.x(), event.y())
+        super().mousePressEvent(event)
 
 
 class CurationWidget(QWidget):
     """
-    Dock widget for accepting/rejecting individual PV segments.
+    Dock widget for accepting/rejecting individual PV segments, with an
+    interactive split tool to separate merged segments by clicking seeds.
 
     Signals
     -------
@@ -113,6 +149,8 @@ class CurationWidget(QWidget):
         measurements: pd.DataFrame,
         ch_cptsa: int,
         ch_mcherry: int,
+        ch_names: dict[int, str] | None = None,
+        pixel_size_um: float | None = None,
         on_save: Callable | None = None,
         parent=None,
     ):
@@ -122,6 +160,8 @@ class CurationWidget(QWidget):
         self._measurements = measurements
         self._ch_cptsa = ch_cptsa
         self._ch_mcherry = ch_mcherry
+        self._ch_names = ch_names or {ch_cptsa: "cptsa", ch_mcherry: "mcherry"}
+        self._pixel_size_um = pixel_size_um
         self._on_save = on_save
 
         self._label_ids: list[int] = (
@@ -129,13 +169,9 @@ class CurationWidget(QWidget):
             if measurements is not None and len(measurements) > 0
             else []
         )
-        # decisions: 1=accept, 0=reject, -1=pending
         self._decisions: dict[int, int] = {lid: -1 for lid in self._label_ids}
         self._current_idx: int = 0
 
-        # vacuole_assignments: maps each parasite label → vacuole ID.
-        # Pre-populated from the 'vacuole_id' column in measurements if present;
-        # otherwise each parasite is treated as its own vacuole.
         if measurements is not None and "vacuole_id" in measurements.columns:
             self._vacuole_assignments: dict[int, int] = {
                 lid: int(measurements.loc[lid, "vacuole_id"])
@@ -146,6 +182,15 @@ class CurationWidget(QWidget):
             self._vacuole_assignments = {
                 lid: i + 1 for i, lid in enumerate(self._label_ids)
             }
+
+        # ── Split-mode state ──────────────────────────────────────────────────
+        self._split_mode: bool = False
+        # Seeds placed by the user: list of (row, col) in full image coordinates
+        self._split_seeds: list[tuple[int, int]] = []
+        # Crop coords for the currently displayed thumbnail
+        self._thumb_crop: tuple[int, int, int, int] | None = None
+        # Raw RGB thumbnail (before seed overlay)
+        self._thumb_raw: np.ndarray | None = None
 
         self._build_ui()
         self._refresh()
@@ -172,11 +217,12 @@ class CurationWidget(QWidget):
         nav.addWidget(self._btn_next)
         layout.addLayout(nav)
 
-        # Thumbnail
-        self._thumbnail_label = QLabel()
+        # Thumbnail — clickable so split-mode seeds can be placed
+        self._thumbnail_label = _ClickableThumbnail()
         self._thumbnail_label.setAlignment(Qt.AlignCenter)
-        self._thumbnail_label.setFixedSize(240, 240)
+        self._thumbnail_label.setFixedSize(_LABEL_SIZE, _LABEL_SIZE)
         self._thumbnail_label.setStyleSheet("background-color: black;")
+        self._thumbnail_label.clicked_at.connect(self._on_thumbnail_clicked)
         layout.addWidget(self._thumbnail_label, alignment=Qt.AlignHCenter)
 
         # Measurement info
@@ -184,7 +230,7 @@ class CurationWidget(QWidget):
         self._info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._info_label)
 
-        # Vacuole ID — auto-assigned by proximity; user can override
+        # Vacuole ID
         vac_row = QHBoxLayout()
         vac_row.addWidget(QLabel("Vacuole ID:"))
         self._vacuole_spin = QSpinBox()
@@ -214,6 +260,40 @@ class CurationWidget(QWidget):
         btn_row.addWidget(self._btn_skip)
         layout.addLayout(btn_row)
 
+        # ── Split section ─────────────────────────────────────────────────────
+        self._btn_split_toggle = QPushButton("✂  Split segment")
+        self._btn_split_toggle.setToolTip(
+            "Enter split mode: click inside the thumbnail to mark each\n"
+            "parasite centre, then click 'Apply split'."
+        )
+        self._btn_split_toggle.clicked.connect(self._toggle_split_mode)
+        layout.addWidget(self._btn_split_toggle)
+
+        # Instruction + apply/cancel row — hidden until split mode is active
+        self._split_panel = QWidget()
+        split_layout = QVBoxLayout(self._split_panel)
+        split_layout.setContentsMargins(0, 0, 0, 0)
+        split_layout.setSpacing(4)
+
+        self._split_info = QLabel("Click each parasite centre — need ≥ 2 points.")
+        self._split_info.setAlignment(Qt.AlignCenter)
+        self._split_info.setStyleSheet("color: #e6ac00; font-style: italic;")
+        self._split_info.setWordWrap(True)
+        split_layout.addWidget(self._split_info)
+
+        split_btn_row = QHBoxLayout()
+        self._btn_apply_split = QPushButton("Apply split")
+        self._btn_apply_split.setStyleSheet("font-weight: bold;")
+        self._btn_apply_split.clicked.connect(self._apply_split)
+        self._btn_cancel_split = QPushButton("Cancel")
+        self._btn_cancel_split.clicked.connect(self._cancel_split)
+        split_btn_row.addWidget(self._btn_apply_split)
+        split_btn_row.addWidget(self._btn_cancel_split)
+        split_layout.addLayout(split_btn_row)
+
+        self._split_panel.setVisible(False)
+        layout.addWidget(self._split_panel)
+
         # Status
         self._status_label = QLabel()
         self._status_label.setAlignment(Qt.AlignCenter)
@@ -232,26 +312,28 @@ class CurationWidget(QWidget):
 
     def _prev(self):
         if self._current_idx > 0:
+            self._cancel_split()
             self._current_idx -= 1
             self._refresh()
 
     def _next(self):
+        self._cancel_split()
         if self._current_idx < len(self._label_ids) - 1:
             self._current_idx += 1
         self._refresh()
 
     def _accept(self):
         if self._label_ids:
+            self._cancel_split()
             lid = self._label_ids[self._current_idx]
             self._decisions[lid] = 1
-            # Advance if not on the last item; otherwise stay and refresh so the
-            # status label and decision text update to show "✓ Accepted".
             if self._current_idx < len(self._label_ids) - 1:
                 self._current_idx += 1
             self._refresh()
 
     def _reject(self):
         if self._label_ids:
+            self._cancel_split()
             lid = self._label_ids[self._current_idx]
             self._decisions[lid] = 0
             if self._current_idx < len(self._label_ids) - 1:
@@ -259,7 +341,6 @@ class CurationWidget(QWidget):
             self._refresh()
 
     def _on_vacuole_id_changed(self, value: int):
-        """Record the user-edited vacuole ID for the currently displayed parasite."""
         if self._label_ids:
             lid = self._label_ids[self._current_idx]
             self._vacuole_assignments[lid] = value
@@ -268,6 +349,194 @@ class CurationWidget(QWidget):
         if self._on_save:
             self._on_save(self._decisions, self._vacuole_assignments)
         self.curation_saved.emit()
+
+    # ------------------------------------------------------------------
+    # Split mode
+    # ------------------------------------------------------------------
+
+    def _toggle_split_mode(self):
+        if self._split_mode:
+            self._cancel_split()
+        else:
+            self._split_mode = True
+            self._split_seeds = []
+            self._split_panel.setVisible(True)
+            self._btn_split_toggle.setText("✂  (split mode ON — click thumbnail)")
+            self._btn_split_toggle.setStyleSheet("color: #e6ac00; font-weight: bold;")
+            self._thumbnail_label.setCursor(Qt.CrossCursor)
+            self._split_info.setText("Click each parasite centre — need ≥ 2 points.")
+
+    def _cancel_split(self):
+        if not self._split_mode:
+            return
+        self._split_mode = False
+        self._split_seeds = []
+        self._split_panel.setVisible(False)
+        self._btn_split_toggle.setText("✂  Split segment")
+        self._btn_split_toggle.setStyleSheet("")
+        self._thumbnail_label.setCursor(Qt.ArrowCursor)
+        # Redraw thumbnail without dots
+        if self._thumb_raw is not None:
+            self._thumbnail_label.setPixmap(
+                _array_to_pixmap(self._thumb_raw, _THUMB_DISPLAY)
+            )
+
+    def _on_thumbnail_clicked(self, wx: int, wy: int):
+        """Convert a thumbnail click to image coordinates and add a seed."""
+        if not self._split_mode or self._thumb_crop is None or not self._label_ids:
+            return
+
+        y0, x0, y1, x1 = self._thumb_crop
+        crop_h, crop_w = y1 - y0, x1 - x0
+        if crop_h <= 0 or crop_w <= 0:
+            return
+
+        # Compute the scale used by _array_to_pixmap
+        scale = min(_THUMB_DISPLAY / crop_h, _THUMB_DISPLAY / crop_w)
+        pix_h = int(crop_h * scale)
+        pix_w = int(crop_w * scale)
+
+        # Pixmap is centered inside the _LABEL_SIZE × _LABEL_SIZE QLabel
+        off_x = (_LABEL_SIZE - pix_w) / 2
+        off_y = (_LABEL_SIZE - pix_h) / 2
+
+        # Map click → image coordinates
+        img_col = int((wx - off_x) / scale) + x0
+        img_row = int((wy - off_y) / scale) + y0
+
+        # Clamp to valid range
+        img_row = max(y0, min(y1 - 1, img_row))
+        img_col = max(x0, min(x1 - 1, img_col))
+
+        # Only accept clicks inside the current segment's mask
+        lid = self._label_ids[self._current_idx]
+        if self._labels[img_row, img_col] != lid:
+            self._split_info.setText(
+                f"Click landed outside segment {lid} — click inside the white outline."
+            )
+            return
+
+        self._split_seeds.append((img_row, img_col))
+        n = len(self._split_seeds)
+        self._split_info.setText(
+            f"{n} point(s) placed."
+            + (" Ready — click 'Apply split'." if n >= 2 else " Need ≥ 2.")
+        )
+        self._redraw_thumbnail()
+
+    def _redraw_thumbnail(self):
+        """Redraw thumbnail overlaying yellow seed dots at current split seeds."""
+        if self._thumb_raw is None or self._thumb_crop is None:
+            return
+
+        y0, x0, y1, x1 = self._thumb_crop
+        crop_h, crop_w = y1 - y0, x1 - x0
+        if crop_h <= 0 or crop_w <= 0:
+            return
+
+        scale = min(_THUMB_DISPLAY / crop_h, _THUMB_DISPLAY / crop_w)
+
+        rgb = self._thumb_raw.copy()
+        for seed_row, seed_col in self._split_seeds:
+            # Convert image coord → thumbnail pixel coord
+            tr = int((seed_row - y0) * scale)
+            tc = int((seed_col - x0) * scale)
+            r = _SEED_DOT_RADIUS
+            for dr in range(-r, r + 1):
+                for dc in range(-r, r + 1):
+                    if dr * dr + dc * dc <= r * r:
+                        nr, nc = tr + dr, tc + dc
+                        if 0 <= nr < rgb.shape[0] and 0 <= nc < rgb.shape[1]:
+                            rgb[nr, nc] = [255, 220, 0]  # yellow
+
+        self._thumbnail_label.setPixmap(_array_to_pixmap(rgb, _THUMB_DISPLAY))
+
+    def _apply_split(self):
+        """Run watershed from the placed seeds and replace the merged segment."""
+        if len(self._split_seeds) < 2:
+            self._split_info.setText("Need at least 2 seed points before splitting.")
+            return
+        if not self._label_ids:
+            return
+
+        from scipy.ndimage import distance_transform_edt
+        from skimage.segmentation import watershed
+
+        lid = self._label_ids[self._current_idx]
+        mask = self._labels == lid
+
+        # Build seed image — one integer per seed point
+        seeds = np.zeros_like(self._labels, dtype=np.int32)
+        for k, (r, c) in enumerate(self._split_seeds, start=1):
+            seeds[r, c] = k
+
+        # Distance-transform watershed seeded by user points
+        dist = distance_transform_edt(mask).astype(np.float64)
+        split_result = watershed(-dist, markers=seeds, mask=mask)
+
+        # Assign new label IDs for each split piece
+        current_max = int(self._labels.max())
+        new_label_ids: list[int] = []
+        for seg_id in sorted(np.unique(split_result)):
+            if seg_id == 0:
+                continue
+            current_max += 1
+            self._labels[split_result == seg_id] = current_max
+            new_label_ids.append(current_max)
+
+        # The original label pixels have all been overwritten above.
+        # Update label_ids list: remove old, insert new at same position.
+        insert_pos = self._current_idx
+        self._label_ids.pop(insert_pos)
+        if lid in self._decisions:
+            del self._decisions[lid]
+        parent_vac = self._vacuole_assignments.pop(lid, insert_pos + 1)
+
+        for i, nl in enumerate(new_label_ids):
+            self._label_ids.insert(insert_pos + i, nl)
+            self._decisions[nl] = -1
+            # New segments inherit the parent's vacuole ID so grouping is preserved
+            self._vacuole_assignments[nl] = parent_vac
+
+        # Re-measure just the new segments so the info panel shows real values
+        self._remeasure_labels(new_label_ids)
+
+        # Exit split mode and navigate to the first new segment
+        self._cancel_split()
+        self._current_idx = min(insert_pos, len(self._label_ids) - 1)
+        self._refresh()
+
+    def _remeasure_labels(self, label_ids: list[int]):
+        """Re-run measure_pvs for the given label IDs and update self._measurements."""
+        import pandas as pd
+
+        from ._measure import measure_pvs
+
+        if self._measurements is None:
+            return
+
+        # Build a temporary label image containing only the new labels
+        temp = np.zeros_like(self._labels)
+        for nl in label_ids:
+            temp[self._labels == nl] = nl
+
+        try:
+            new_rows = measure_pvs(
+                labels=temp,
+                image=self._image,
+                ch_cptsa=self._ch_cptsa,
+                ch_mcherry=self._ch_mcherry,
+                ch_names=self._ch_names,
+                pixel_size_um=self._pixel_size_um,
+            )
+        except Exception:
+            return  # measurements unavailable for new segments — info panel shows "—"
+
+        # Drop the old row for the parent label (already removed from _label_ids)
+        # and append the new rows
+        self._measurements = pd.concat([self._measurements, new_rows]).loc[
+            lambda df: ~df.index.duplicated(keep="last")
+        ]
 
     # ------------------------------------------------------------------
     # Display
@@ -287,11 +556,13 @@ class CurationWidget(QWidget):
         lid = self._label_ids[idx]
         self._lbl_nav.setText(f"Parasite {idx + 1} / {n}  (id={lid})")
 
-        # Thumbnail
-        thumb = _make_thumbnail(
+        # Generate thumbnail and store crop coords for split-mode coordinate mapping
+        thumb, crop = _make_thumbnail(
             self._image, self._labels, lid, self._ch_cptsa, self._ch_mcherry
         )
-        self._thumbnail_label.setPixmap(_array_to_pixmap(thumb, 230))
+        self._thumb_raw = thumb
+        self._thumb_crop = crop
+        self._thumbnail_label.setPixmap(_array_to_pixmap(thumb, _THUMB_DISPLAY))
 
         # Info
         row = (
@@ -313,7 +584,6 @@ class CurationWidget(QWidget):
         else:
             self._info_label.setText("")
 
-        # Sync vacuole ID spinbox (suppress valueChanged so we don't overwrite)
         self._vacuole_spin.blockSignals(True)
         self._vacuole_spin.setValue(self._vacuole_assignments.get(lid, lid))
         self._vacuole_spin.blockSignals(False)

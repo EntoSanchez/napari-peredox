@@ -929,12 +929,20 @@ class PeredoxWidget(QWidget):
 
         from ._curation import CurationWidget
 
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[self._ch_cptsa.value()] = "cptsa"
+        ch_names[self._ch_mcherry.value()] = "mcherry"
+        px = self._pixel_size.value()
+
         self._curation_win = CurationWidget(
             labels=self._labels,
             image=image,
             measurements=self._measurements,
             ch_cptsa=self._ch_cptsa.value(),
             ch_mcherry=self._ch_mcherry.value(),
+            ch_names=ch_names,
+            pixel_size_um=px if px > 0 else None,
             on_save=self._on_curation_saved,
             parent=None,
         )
