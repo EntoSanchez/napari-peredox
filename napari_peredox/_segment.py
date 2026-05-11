@@ -151,6 +151,8 @@ def segment_pvs(
     threshold_channel: int | None = None,
     threshold_value: float = 0.0,
     threshold_percentile: float = 50.0,
+    watershed_split: bool = False,
+    watershed_min_distance: int = 10,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Run Cellpose-SAM on a 2-D fluorescence image and return an integer label array.
@@ -200,6 +202,16 @@ def segment_pvs(
         Explicit cutoff when threshold_method='manual'.
     threshold_percentile : float
         Percentile cutoff (0–100) when threshold_method='percentile'.
+    watershed_split : bool
+        If True, apply distance-transform watershed to split each Cellpose
+        mask into individual parasites before morphological filtering.
+        Useful when Cellpose segments the whole vacuole as one object.
+        The segmentation channel is used to weight the distance peaks so that
+        intensity maxima (bright parasite bodies) become preferred split seeds.
+    watershed_min_distance : int
+        Minimum pixel distance between neighbouring parasite centres when
+        finding watershed seeds.  Should be roughly the radius of one
+        parasite in pixels (default 10 ≈ 1 µm at 0.105 µm/px, 60× objective).
 
     Returns
     -------
@@ -286,7 +298,14 @@ def segment_pvs(
     )
     raw_labels = masks.astype(np.int32)
 
-    # ── Step 4: morphological filtering ──────────────────────────────────────
+    # ── Step 4 (optional): watershed splitting ───────────────────────────────
+    # Split Cellpose masks that cover entire vacuoles into individual parasites.
+    # Applied BEFORE morphology filtering so each daughter segment is
+    # independently evaluated against the area / eccentricity / solidity gates.
+    if watershed_split and raw_labels.max() > 0:
+        raw_labels = _watershed_split(raw_labels, seg_img, watershed_min_distance)
+
+    # ── Step 5: morphological filtering ──────────────────────────────────────
     filtered_labels, filter_stats = _filter_by_morphology(
         raw_labels, min_area_px, max_area_px, max_eccentricity, min_solidity
     )
@@ -485,6 +504,84 @@ def _filter_by_morphology(
         "kept": total - n_area - n_ecc - n_sol,
     }
     return out, stats
+
+
+def _watershed_split(
+    labels: np.ndarray,
+    intensity: np.ndarray,
+    min_distance: int = 10,
+) -> np.ndarray:
+    """
+    Split over-merged Cellpose masks into individual parasites via watershed.
+
+    For each labelled region:
+      1. Compute the Euclidean distance transform of the binary mask — pixels
+         deep inside the object score highest.
+      2. Weight the distance map by local image intensity so that bright
+         parasite bodies become taller peaks and dark inter-parasite gaps
+         become valleys.
+      3. Find local maxima in the weighted distance map that are at least
+         ``min_distance`` pixels apart — each maximum is one parasite centre.
+      4. Run marker-controlled watershed on the inverted distance map,
+         partitioning the region into one segment per maximum.
+
+    Regions with only one detected maximum are kept unchanged.  The output
+    labels are re-numbered consecutively from 1 across the whole image.
+    """
+    from scipy.ndimage import distance_transform_edt
+    from skimage.feature import peak_local_max
+    from skimage.measure import regionprops
+    from skimage.segmentation import watershed
+
+    out = np.zeros_like(labels)
+    next_id = 1
+
+    for rp in regionprops(labels):
+        sl = rp.slice
+        mask = labels[sl] == rp.label
+
+        # Distance transform — high inside the mask, 0 on the boundary
+        dist = distance_transform_edt(mask).astype(np.float64)
+
+        # Blend with normalised local intensity (50 % shape, 50 % brightness)
+        patch = intensity[sl].astype(np.float64)
+        p_min, p_max = patch.min(), patch.max()
+        if p_max > p_min:
+            patch = (patch - p_min) / (p_max - p_min)
+        else:
+            patch = np.zeros_like(patch)
+        weighted = dist * (0.5 + 0.5 * patch)
+
+        # Seed detection — one seed per candidate parasite
+        coords = peak_local_max(
+            weighted,
+            min_distance=min_distance,
+            labels=mask,
+        )
+
+        if len(coords) <= 1:
+            # Single object or empty — no splitting needed
+            out[labels == rp.label] = next_id
+            next_id += 1
+            continue
+
+        # Build a seed image: each peak gets a unique integer ID
+        seeds = np.zeros(mask.shape, dtype=np.int32)
+        for k, (r, c) in enumerate(coords, start=1):
+            seeds[r, c] = k
+
+        # Watershed on the inverted distance map; mask confines it to the PV
+        split = watershed(-weighted, markers=seeds, mask=mask)
+
+        for seg_id in np.unique(split):
+            if seg_id == 0:
+                continue
+            seg_pixels = np.zeros_like(labels, dtype=bool)
+            seg_pixels[sl] = split == seg_id
+            out[seg_pixels] = next_id
+            next_id += 1
+
+    return out.astype(np.int32)
 
 
 def _relabel(labels: np.ndarray) -> np.ndarray:

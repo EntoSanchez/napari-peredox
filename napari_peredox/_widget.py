@@ -96,6 +96,8 @@ class _SegmentWorker(QObject):
             group_vacuoles = p["group_vacuoles"]
             dilation_px = p["dilation_px"]
             vacuole_method = p["vacuole_method"]
+            watershed_split = p["watershed_split"]
+            watershed_min_distance = p["watershed_min_distance"]
             threshold_method = p["threshold_method"]
             threshold_channel = p["threshold_channel"]
             threshold_value = p["threshold_value"]
@@ -145,6 +147,8 @@ class _SegmentWorker(QObject):
                 threshold_channel=threshold_channel,
                 threshold_value=threshold_value,
                 threshold_percentile=threshold_percentile,
+                watershed_split=watershed_split,
+                watershed_min_distance=watershed_min_distance,
             )
 
             # Log threshold diagnostic first
@@ -362,6 +366,30 @@ class PeredoxWidget(QWidget):
         form.addRow("Select parasite by:", self._vacuole_method)
         self._group_vacuoles.toggled.connect(self._dilation_px.setEnabled)
         self._group_vacuoles.toggled.connect(self._vacuole_method.setEnabled)
+
+        # Watershed splitting
+        self._watershed_split = QCheckBox("Split merged segments (watershed)")
+        self._watershed_split.setChecked(False)
+        self._watershed_split.setToolTip(
+            "If Cellpose segments the whole vacuole as one object, enable this\n"
+            "to split each mask into individual parasites using distance-transform\n"
+            "watershed seeded by intensity peaks.\n"
+            "Tune 'Min separation' to match the parasite radius in pixels."
+        )
+        self._watershed_min_dist = QSpinBox()
+        self._watershed_min_dist.setRange(2, 200)
+        self._watershed_min_dist.setValue(10)
+        self._watershed_min_dist.setToolTip(
+            "Minimum pixel distance between neighbouring parasite centres.\n"
+            "≈ parasite radius in pixels. At 0.105 µm/px (60×), 10 px ≈ 1 µm."
+        )
+        watershed_row = QHBoxLayout()
+        watershed_row.addWidget(self._watershed_split)
+        watershed_row.addWidget(QLabel("min sep:"))
+        watershed_row.addWidget(self._watershed_min_dist)
+        form.addRow("Watershed split:", watershed_row)
+        self._watershed_split.toggled.connect(self._watershed_min_dist.setEnabled)
+        self._watershed_min_dist.setEnabled(False)
 
         # Cellpose thresholds
         self._flow_thresh = QDoubleSpinBox()
@@ -757,6 +785,8 @@ class PeredoxWidget(QWidget):
             "group_vacuoles": self._group_vacuoles.isChecked(),
             "dilation_px": self._dilation_px.value(),
             "vacuole_method": self._vacuole_method.currentText(),
+            "watershed_split": self._watershed_split.isChecked(),
+            "watershed_min_distance": self._watershed_min_dist.value(),
             "threshold_method": self._thresh_method.currentText(),
             "threshold_channel": self._thresh_channel.value(),
             "threshold_value": self._thresh_value.value(),
