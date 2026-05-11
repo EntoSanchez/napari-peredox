@@ -656,6 +656,11 @@ class CurationWidget(QWidget):
         self._thumb_crop = crop
         self._thumbnail_label.setPixmap(_array_to_pixmap(thumb, _THUMB_DISPLAY))
 
+        # Count all labels sharing this vacuole directly from _vacuole_assignments
+        # (more reliable than measurements['parasites_per_vacuole'] which is stale
+        # after splits and missing for freshly-remeasured segments).
+        n_in_vac = 1 + len(siblings)
+
         # Info
         row = (
             self._measurements.loc[lid]
@@ -666,10 +671,6 @@ class CurationWidget(QWidget):
             area = int(row.get("area_px", 0))
             ratio = row.get("ratio_cptsa_mcherry", float("nan"))
             ratio_str = f"{ratio:.3f}" if not np.isnan(ratio) else "—"
-            try:
-                n_in_vac = int(row.get("parasites_per_vacuole", 1))
-            except (ValueError, TypeError):
-                n_in_vac = 1
             decision = {1: "✓ Accepted", 0: "✗ Rejected", -1: "Pending"}[
                 self._decisions[lid]
             ]
