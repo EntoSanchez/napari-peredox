@@ -282,6 +282,76 @@ class _ParasiteWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Background worker — Stage H1: host-cell segmentation
+# ---------------------------------------------------------------------------
+
+
+class _HostWorker(QObject):
+    """Run host-cell segmentation (cpSAM + clip) in a background thread."""
+
+    finished = Signal(object, object)  # (raw_host_labels, host_labels)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self.params = params
+
+    def run(self) -> None:
+        try:
+            p = self.params
+            from ._host import segment_host_cells
+
+            self.progress.emit("Running cpSAM host-cell segmentation…")
+            host_labels, raw_labels, stats = segment_host_cells(
+                image=p["image"],
+                channel_index=p["host_ch"],
+                clip_percentile=p["clip_percentile"],
+                diameter=p.get("diameter"),
+                flow_threshold=p.get("flow_threshold", 0.4),
+                cellprob_threshold=p.get("cellprob_threshold", 0.0),
+                min_area_px=p["min_area_px"],
+                max_area_px=p["max_area_px"],
+            )
+            if stats.get("clip_skipped"):
+                self.progress.emit(
+                    "WARNING: bright-pixel clip flattened the image — "
+                    "segmented the unclipped channel instead."
+                )
+            self.progress.emit(
+                f"cpSAM hosts: {stats['total_raw']} raw → {stats['kept']} "
+                f"after area gate (clip @ p{stats['clip_percentile']:.1f})."
+            )
+
+            # Optional host classifier filter (spec §6)
+            classifier = p.get("classifier")
+            if classifier is not None and host_labels.max() > 0:
+                from ._learning import extract_features
+                from ._segment import apply_classifier_filter
+
+                feats = extract_features(
+                    labels=host_labels,
+                    image=p["image"],
+                    seg_channel=p["host_ch"],
+                    ch_cptsa=p["ch_cptsa"],
+                    ch_mcherry=p["ch_mcherry"],
+                    ch_names=p["ch_names"],
+                )
+                n_before = int(len(feats))
+                host_labels = apply_classifier_filter(host_labels, feats, classifier)
+                self.progress.emit(
+                    f"Host classifier: {n_before} → "
+                    f"{int(host_labels.max())} hosts kept."
+                )
+
+            self.finished.emit(raw_labels, host_labels)
+        except Exception:
+            import traceback
+
+            self.error.emit(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
 
@@ -303,6 +373,15 @@ class PeredoxWidget(QWidget):
         self._measurements = None
         self._vac_map: dict = {}
 
+        # Host-mode state (Host tab) — never shared with PV-mode state above
+        self._host_labels: np.ndarray | None = None
+        self._host_para_labels: np.ndarray | None = None
+        self._host_vac_map: dict = {}
+        self._host_features = None
+        self._host_para_measurements = None
+        self._host_measurements = None
+        self._host_classifier = None
+
         self._classifier = None
         self._thread: QThread | None = None
         self._worker = None
@@ -323,6 +402,7 @@ class PeredoxWidget(QWidget):
 
         tabs.addTab(self._build_setup_tab(), "Setup")
         tabs.addTab(self._build_segment_tab(), "Segment")
+        tabs.addTab(self._build_host_tab(), "Host")
         tabs.addTab(self._build_training_tab(), "Training")
 
         root.addWidget(tabs)
@@ -1292,6 +1372,268 @@ class PeredoxWidget(QWidget):
         self._btn_save_csv.setEnabled(True)
         self._btn_review_para.setEnabled(True)
         self._open_parasite_curation()
+
+    # ── Host tab ─────────────────────────────────────────────────────────────
+
+    def _build_host_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # Host segmentation parameters
+        par_box = QGroupBox("Host segmentation (cpSAM)")
+        par_form = QFormLayout(par_box)
+        par_form.setContentsMargins(6, 6, 6, 6)
+
+        self._host_ch = QSpinBox()
+        self._host_ch.setRange(0, 15)
+        self._host_ch.setValue(1)
+        self._host_ch.setToolTip(
+            "Channel for host-cell segmentation (default: mCherry)."
+        )
+        par_form.addRow("Host channel:", self._host_ch)
+
+        self._host_clip_pct = QDoubleSpinBox()
+        self._host_clip_pct.setRange(50.0, 100.0)
+        self._host_clip_pct.setDecimals(1)
+        self._host_clip_pct.setSingleStep(0.5)
+        self._host_clip_pct.setValue(99.0)
+        self._host_clip_pct.setToolTip(
+            "Clip pixels above this percentile before cpSAM so bright\n"
+            "parasites don't flatten host contrast. 100 = no clipping."
+        )
+        par_form.addRow("Clip percentile:", self._host_clip_pct)
+
+        self._host_diameter = QSpinBox()
+        self._host_diameter.setRange(0, 2000)
+        self._host_diameter.setValue(0)
+        self._host_diameter.setSpecialValueText("auto")
+        self._host_diameter.setToolTip("Expected host-cell diameter in px (0 = auto).")
+        par_form.addRow("Diameter (px):", self._host_diameter)
+
+        self._host_min_area_um2 = QDoubleSpinBox()
+        self._host_min_area_um2.setRange(0.0, 1e6)
+        self._host_min_area_um2.setDecimals(0)
+        self._host_min_area_um2.setValue(200.0)
+        self._host_max_area_um2 = QDoubleSpinBox()
+        self._host_max_area_um2.setRange(0.0, 1e6)
+        self._host_max_area_um2.setDecimals(0)
+        self._host_max_area_um2.setValue(10000.0)
+        area_row = QHBoxLayout()
+        area_row.addWidget(QLabel("min:"))
+        area_row.addWidget(self._host_min_area_um2)
+        area_row.addWidget(QLabel("max:"))
+        area_row.addWidget(self._host_max_area_um2)
+        par_form.addRow("Host area (µm²):", area_row)
+
+        self._host_dilation_px = QSpinBox()
+        self._host_dilation_px.setRange(0, 50)
+        self._host_dilation_px.setValue(3)
+        self._host_dilation_px.setToolTip(
+            "Dilate parasite masks by this many px before excluding them\n"
+            "from the host ratio (buffer against signal bleed-over)."
+        )
+        par_form.addRow("Parasite exclusion buffer (px):", self._host_dilation_px)
+
+        self._host_use_classifier = QCheckBox("Apply host classifier filter")
+        par_form.addRow("", self._host_use_classifier)
+
+        layout.addWidget(par_box)
+
+        # Stage H1
+        h1_box = QGroupBox("Stage H1 — Host cells")
+        h1_layout = QVBoxLayout(h1_box)
+        self._btn_host_stage1 = QPushButton("▶ Segment host cells")
+        self._btn_host_stage1.setStyleSheet("font-weight: bold;")
+        self._btn_host_stage1.clicked.connect(self._run_host_stage1)
+        h1_layout.addWidget(self._btn_host_stage1)
+        self._lbl_host_stage1 = QLabel("Not run yet.")
+        self._lbl_host_stage1.setWordWrap(True)
+        h1_layout.addWidget(self._lbl_host_stage1)
+        self._btn_host_review = QPushButton("🔍 Review host cells")
+        self._btn_host_review.clicked.connect(self._open_host_curation)
+        self._btn_host_review.setEnabled(False)
+        h1_layout.addWidget(self._btn_host_review)
+        layout.addWidget(h1_box)
+
+        # Stage H2
+        h2_box = QGroupBox("Stage H2 — Parasites in hosts")
+        h2_layout = QVBoxLayout(h2_box)
+        self._btn_host_stage2 = QPushButton("▶ Segment parasites in hosts")
+        self._btn_host_stage2.setStyleSheet("font-weight: bold;")
+        self._btn_host_stage2.clicked.connect(self._run_host_stage2)
+        self._btn_host_stage2.setEnabled(False)
+        h2_layout.addWidget(self._btn_host_stage2)
+        self._lbl_host_stage2 = QLabel("Segment and review host cells first.")
+        self._lbl_host_stage2.setWordWrap(True)
+        h2_layout.addWidget(self._lbl_host_stage2)
+        self._btn_host_review_para = QPushButton("🔍 Review parasites")
+        self._btn_host_review_para.clicked.connect(self._open_host_parasite_curation)
+        self._btn_host_review_para.setEnabled(False)
+        h2_layout.addWidget(self._btn_host_review_para)
+        layout.addWidget(h2_box)
+
+        # Stage H3
+        h3_box = QGroupBox("Stage H3 — Measure && export")
+        h3_layout = QVBoxLayout(h3_box)
+        self._btn_host_measure = QPushButton("▶ Assign, measure && show table")
+        self._btn_host_measure.setStyleSheet("font-weight: bold;")
+        self._btn_host_measure.clicked.connect(self._run_host_measure)
+        self._btn_host_measure.setEnabled(False)
+        h3_layout.addWidget(self._btn_host_measure)
+        self._lbl_host_measure = QLabel("Complete Stages H1–H2 first.")
+        self._lbl_host_measure.setWordWrap(True)
+        h3_layout.addWidget(self._lbl_host_measure)
+        self._btn_host_export = QPushButton("💾 Export host && parasite CSVs")
+        self._btn_host_export.clicked.connect(self._export_host_csv)
+        self._btn_host_export.setEnabled(False)
+        h3_layout.addWidget(self._btn_host_export)
+        layout.addWidget(h3_box)
+
+        layout.addStretch()
+        return w
+
+    def _host_pixel_area_limits(self) -> tuple[float, float]:
+        px = self._pixel_size.value()
+        if px > 0:
+            return (
+                self._host_min_area_um2.value() / (px**2),
+                self._host_max_area_um2.value() / (px**2),
+            )
+        return 0.0, 1e9
+
+    # ── Stage H1: host-cell segmentation ─────────────────────────────────────
+
+    def _run_host_stage1(self) -> None:
+        try:
+            image = self._get_image_array()
+        except RuntimeError as exc:
+            self._log_msg(f"Error: {exc}")
+            return
+
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[self._ch_cptsa.value()] = "cptsa"
+        ch_names[self._ch_mcherry.value()] = "mcherry"
+        self._image_stem = self._layer_combo.currentText().replace(" ", "_") or "image"
+
+        if self._pixel_size.value() == 0:
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Pixel size not set",
+                "Enter physical pixel size (µm/px).\n"
+                "Cancel or enter 0 to disable the host area filter:",
+                decimals=4,
+                min=0.0,
+                max=100.0,
+                value=0.105,
+            )
+            if ok and val > 0:
+                self._pixel_size.setValue(val)
+
+        min_area_px, max_area_px = self._host_pixel_area_limits()
+
+        host_classifier = None
+        if self._host_use_classifier.isChecked():
+            from ._learning import load_classifier
+
+            host_classifier = load_classifier(
+                self._annot_dir.text(), filename="curated_host_features.joblib"
+            )
+            if host_classifier is None:
+                self._log_msg("No host classifier trained yet — running without.")
+
+        diameter = self._host_diameter.value()
+        params = {
+            "image": image,
+            "host_ch": self._host_ch.value(),
+            "clip_percentile": self._host_clip_pct.value(),
+            "diameter": float(diameter) if diameter > 0 else None,
+            "flow_threshold": self._flow_thresh.value(),
+            "cellprob_threshold": self._cellprob_thresh.value(),
+            "min_area_px": min_area_px,
+            "max_area_px": max_area_px,
+            "classifier": host_classifier,
+            "ch_cptsa": self._ch_cptsa.value(),
+            "ch_mcherry": self._ch_mcherry.value(),
+            "ch_names": ch_names,
+        }
+
+        self._btn_host_stage1.setEnabled(False)
+        self._btn_host_stage1.setText("Running…")
+        self._lbl_host_stage1.setText("Segmenting host cells…")
+
+        from ._segment import preload_model
+
+        self._log_msg(preload_model())
+
+        self._thread = QThread()
+        self._worker = _HostWorker(params)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_host_stage1_done)
+        self._worker.error.connect(self._on_host_worker_error)
+        self._worker.progress.connect(self._log_msg)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.error.connect(self._thread.quit)
+        self._thread.start()
+
+    def _on_host_stage1_done(
+        self, raw_host_labels: np.ndarray, host_labels: np.ndarray
+    ) -> None:
+        self._host_labels = host_labels
+        # Reset downstream host state — new hosts invalidate old parasites
+        self._host_para_labels = None
+        self._host_vac_map = {}
+        self._host_measurements = None
+        stem = self._image_stem
+
+        raw_name = f"{stem}_host_candidates"
+        if raw_name in self._viewer.layers:
+            self._viewer.layers[raw_name].data = raw_host_labels
+        else:
+            self._viewer.add_labels(raw_host_labels, name=raw_name, opacity=0.2)
+
+        host_name = f"{stem}_hosts"
+        if host_name in self._viewer.layers:
+            self._viewer.layers[host_name].data = host_labels
+        else:
+            self._viewer.add_labels(host_labels, name=host_name)
+
+        n = len(np.unique(host_labels)) - 1
+        self._lbl_host_stage1.setText(f"Found {n} host cells.")
+        self._log_msg(f"Stage H1 done — {n} host cells.")
+        self._btn_host_stage1.setEnabled(True)
+        self._btn_host_stage1.setText("▶ Segment host cells")
+        self._btn_host_review.setEnabled(True)
+        self._btn_host_stage2.setEnabled(n > 0)
+        if n == 0:
+            self._lbl_host_stage2.setText("No hosts found — Stage H2 unavailable.")
+
+    def _on_host_worker_error(self, msg: str) -> None:
+        self._log_msg(f"Error:\n{msg}")
+        self._btn_host_stage1.setEnabled(True)
+        self._btn_host_stage1.setText("▶ Segment host cells")
+        self._btn_host_stage2.setEnabled(self._host_labels is not None)
+        self._btn_host_stage2.setText("▶ Segment parasites in hosts")
+
+    # ── Placeholders completed in Tasks 9–11 ─────────────────────────────────
+
+    def _open_host_curation(self) -> None:
+        self._log_msg("Host curation not implemented yet (Task 9).")
+
+    def _run_host_stage2(self) -> None:
+        self._log_msg("Stage H2 not implemented yet (Task 10).")
+
+    def _open_host_parasite_curation(self) -> None:
+        self._log_msg("Host parasite curation not implemented yet (Task 10).")
+
+    def _run_host_measure(self) -> None:
+        self._log_msg("Stage H3 not implemented yet (Task 11).")
+
+    def _export_host_csv(self) -> None:
+        self._log_msg("Host export not implemented yet (Task 11).")
 
 
 # ---------------------------------------------------------------------------
