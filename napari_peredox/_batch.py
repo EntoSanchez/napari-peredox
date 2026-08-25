@@ -1786,6 +1786,9 @@ class BatchWidget(QWidget):
         # Store raw results and reset any prior curation decisions
         self._result_df = result
         self._curation_decisions = {}
+        # Clear stale host results so a later Save doesn't re-write the
+        # previous host batch's CSVs instead of this PV batch's results.
+        self._host_results = {}
 
         n_positions = len(curation_list)
 
@@ -2312,14 +2315,17 @@ class BatchWidget(QWidget):
         """Write results.csv from measurements accumulated during curation."""
         if getattr(self, "_host_results", None):
             out_folder = self._pending_out_folder
+            hosts_list = [
+                v["hosts"] for v in self._host_results.values() if not v["hosts"].empty
+            ]
+            if not hosts_list:
+                self._log_msg(
+                    "No host rows to save — review at least one position with "
+                    "accepted hosts."
+                )
+                return
             out_folder.mkdir(parents=True, exist_ok=True)
-            hosts_all = pd.concat(
-                [
-                    v["hosts"]
-                    for v in self._host_results.values()
-                    if not v["hosts"].empty
-                ]
-            )
+            hosts_all = pd.concat(hosts_list)
             paras = [
                 v["parasites"]
                 for v in self._host_results.values()
