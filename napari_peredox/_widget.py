@@ -383,6 +383,7 @@ class PeredoxWidget(QWidget):
         self._host_classifier = None
         self._host_thread: QThread | None = None
         self._host_worker = None
+        self._host_review_saved: bool = False
 
         self._classifier = None
         self._thread: QThread | None = None
@@ -1589,6 +1590,7 @@ class PeredoxWidget(QWidget):
         self._host_para_labels = None
         self._host_vac_map = {}
         self._host_measurements = None
+        self._host_review_saved = False
         stem = self._image_stem
 
         raw_name = f"{stem}_host_candidates"
@@ -1614,13 +1616,105 @@ class PeredoxWidget(QWidget):
         self._log_msg(f"Error:\n{msg}")
         self._btn_host_stage1.setEnabled(True)
         self._btn_host_stage1.setText("▶ Segment host cells")
-        self._btn_host_stage2.setEnabled(self._host_labels is not None)
+        self._btn_host_stage2.setEnabled(
+            self._host_labels is not None and self._host_review_saved
+        )
         self._btn_host_stage2.setText("▶ Segment parasites in hosts")
 
-    # ── Placeholders completed in Tasks 9–11 ─────────────────────────────────
+    # ── Host curation ────────────────────────────────────────────────────────
 
     def _open_host_curation(self) -> None:
-        self._log_msg("Host curation not implemented yet (Task 9).")
+        if self._host_labels is None:
+            self._log_msg("Run Stage H1 first.")
+            return
+        try:
+            image = self._get_image_array()
+        except RuntimeError:
+            image = np.zeros((*self._host_labels.shape, 2), dtype=np.float32)
+
+        from ._curation import VacuoleCurationWidget
+
+        host_layer_name = f"{self._image_stem}_hosts"
+        self._host_curation_win = VacuoleCurationWidget(
+            vac_labels=self._host_labels,
+            image=image,
+            ch_cptsa=self._ch_cptsa.value(),
+            ch_mcherry=self._ch_mcherry.value(),
+            on_save=self._on_host_curation_saved,
+            viewer=self._viewer,
+            labels_layer_name=host_layer_name,
+            object_name="host cell",
+            parent=None,
+        )
+        self._host_curation_win.setWindowTitle("Peredox — Host Cell Review (Stage H1)")
+        self._host_curation_win.resize(360, 560)
+        self._host_curation_win.show()
+
+    def _on_host_curation_saved(
+        self, decisions: dict, curated_host_labels: np.ndarray
+    ) -> None:
+        """Persist host accept/reject decisions and retrain the host classifier."""
+        self._host_labels = curated_host_labels.copy()
+
+        # Grow the host training CSV and retrain (spec §6) — separate files
+        # from the PV classifier, same machinery.
+        try:
+            image = self._get_image_array()
+            from ._io import append_curated_annotations
+            from ._learning import extract_features, train_classifier
+
+            n_ch = image.shape[-1]
+            ch_names = {i: f"ch{i}" for i in range(n_ch)}
+            ch_names[self._ch_cptsa.value()] = "cptsa"
+            ch_names[self._ch_mcherry.value()] = "mcherry"
+
+            feats = extract_features(
+                labels=curated_host_labels,
+                image=image,
+                seg_channel=self._host_ch.value(),
+                ch_cptsa=self._ch_cptsa.value(),
+                ch_mcherry=self._ch_mcherry.value(),
+                ch_names=ch_names,
+            )
+            csv_path = append_curated_annotations(
+                decisions=decisions,
+                features=feats,
+                image_stem=self._image_stem,
+                annotations_dir=self._annot_dir.text(),
+                csv_name="curated_host_features.csv",
+            )
+            n_dec = sum(1 for v in decisions.values() if v in (0, 1))
+            self._log_msg(f"Saved {n_dec} host annotations → {csv_path}")
+
+            clf = train_classifier(csv_path)
+            if clf is not None:
+                self._host_classifier = clf
+                self._log_msg("Host classifier retrained.")
+            else:
+                self._log_msg("Not enough host data to train the classifier yet.")
+        except Exception as exc:
+            self._log_msg(f"Host annotation save error: {exc}")
+
+        # Drop rejected hosts from the working label image
+        rejected = {hid for hid, dec in decisions.items() if dec == 0}
+        for hid in rejected:
+            self._host_labels[self._host_labels == hid] = 0
+
+        n_remaining = len(np.unique(self._host_labels)) - 1
+        self._log_msg(f"Host curation saved — {n_remaining} hosts kept.")
+        self._lbl_host_stage1.setText(
+            f"Curation done — {n_remaining} accepted hosts ready for Stage H2."
+        )
+        self._host_review_saved = True
+        self._btn_host_stage2.setEnabled(n_remaining > 0)
+        if n_remaining > 0:
+            self._lbl_host_stage2.setText("Ready — click to detect parasites.")
+        # Invalidate any parasites detected against the pre-curation hosts
+        self._host_para_labels = None
+        self._btn_host_review_para.setEnabled(False)
+        self._btn_host_measure.setEnabled(False)
+
+    # ── Placeholders completed in Tasks 10–11 ────────────────────────────────
 
     def _run_host_stage2(self) -> None:
         self._log_msg("Stage H2 not implemented yet (Task 10).")
