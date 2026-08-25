@@ -1783,6 +1783,9 @@ class BatchWidget(QWidget):
             # empty too, so there's nothing to review or save.
             if not result:
                 self._result_df = None
+                self._host_results = {}
+                self._curation_data = []
+                self._curation_combo.clear()
                 self._progress_bar.setValue(100)
                 self._log_msg(
                     "Host batch complete — no host cells detected in any position."

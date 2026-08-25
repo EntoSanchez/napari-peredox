@@ -1707,6 +1707,10 @@ class PeredoxWidget(QWidget):
 
         self._btn_host_stage1.setEnabled(False)
         self._btn_host_stage1.setText("Running…")
+        self._btn_host_stage2.setEnabled(False)
+        self._btn_host_review_para.setEnabled(False)
+        self._btn_host_measure.setEnabled(False)
+        self._btn_host_export.setEnabled(False)
         self._lbl_host_stage1.setText("Segmenting host cells…")
 
         from ._segment import preload_model
