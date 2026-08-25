@@ -352,6 +352,148 @@ class _HostWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Background worker — Stage H2: parasites within accepted hosts
+# ---------------------------------------------------------------------------
+
+
+class _HostParasiteWorker(QObject):
+    """Vacuole→parasite detection on the host-masked image (spec §4 H2)."""
+
+    finished = Signal(object, object, object, object)
+    # (para_labels, vacuole_map, features, para_measurements)
+    error = Signal(str)
+    progress = Signal(str)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self.params = params
+
+    def run(self) -> None:
+        try:
+            p = self.params
+            image = p["image"]
+            host_labels = p["host_labels"]
+            seg_ch = p["seg_ch"]
+            seg_backend = p.get("seg_backend", 0)
+            annot_dir = p.get("annot_dir", "")
+
+            # Zero the image outside accepted hosts: extracellular parasites
+            # and parasites in non-expressing cells are excluded by
+            # construction (spec §2 population rule).
+            host_union = host_labels > 0
+            masked = image * host_union[..., np.newaxis].astype(image.dtype)
+
+            # ── Vacuole detection on the masked image ────────────────────────
+            if seg_backend == 1:
+                from pathlib import Path as _Path
+
+                from ._segment import filter_labels
+                from ._stardist import load_stardist_model, predict_stardist
+
+                model_dir = _Path(annot_dir) / "stardist_model"
+                self.progress.emit("Loading vacuole StarDist model…")
+                sd_vac = load_stardist_model(model_dir, mode="vacuoles")
+                if sd_vac is None:
+                    raise RuntimeError(
+                        "Vacuole StarDist model not found — train it first "
+                        "or switch the Setup tab to cpSAM."
+                    )
+                raw_vac = predict_stardist(masked, sd_vac, seg_ch)
+                vac_labels, _, fstats = filter_labels(
+                    raw_vac,
+                    p["vac_min_area_px"],
+                    p["vac_max_area_px"],
+                    p["max_eccentricity"],
+                    p["min_solidity"],
+                )
+            else:
+                from ._segment import segment_pvs
+
+                self.progress.emit("Running cpSAM vacuole detection in hosts…")
+                vac_labels, _, fstats = segment_pvs(
+                    image=masked,
+                    channel_index=seg_ch,
+                    use_composite=p.get("use_composite", False),
+                    min_area_px=p["vac_min_area_px"],
+                    max_area_px=p["vac_max_area_px"],
+                    max_eccentricity=p["max_eccentricity"],
+                    min_solidity=p["min_solidity"],
+                    diameter=p.get("diameter"),
+                    flow_threshold=p.get("flow_threshold", 0.4),
+                    cellprob_threshold=p.get("cellprob_threshold", 0.0),
+                    threshold_method=p.get("threshold_method", "none"),
+                    threshold_channel=p.get("threshold_channel", seg_ch),
+                    threshold_value=p.get("threshold_value", 0.0),
+                    threshold_percentile=p.get("threshold_percentile", 50.0),
+                )
+            self.progress.emit(
+                f"Vacuoles in hosts: {fstats['total_raw']} raw → "
+                f"{fstats['kept']} after filter."
+            )
+
+            # ── Parasites within those vacuoles ──────────────────────────────
+            sd_para = None
+            if seg_backend == 1:
+                from pathlib import Path as _Path
+
+                from ._stardist import load_stardist_model
+
+                sd_para = load_stardist_model(
+                    _Path(annot_dir) / "stardist_model", mode="parasites"
+                )
+                if sd_para is None:
+                    self.progress.emit(
+                        "Parasite StarDist model not found — using cpSAM fallback."
+                    )
+
+            from ._segment import segment_parasites_in_vacuoles
+
+            para_labels, vacuole_map = segment_parasites_in_vacuoles(
+                image=masked,
+                vac_labels=vac_labels,
+                seg_channel=seg_ch,
+                model=sd_para,
+                min_area_px=p["min_area_px"],
+                max_area_px=p["max_area_px"],
+                max_eccentricity=p["max_eccentricity"],
+                min_solidity=p["min_solidity"],
+                progress_cb=self.progress.emit,
+            )
+
+            from ._learning import extract_features
+
+            features = extract_features(
+                labels=para_labels,
+                image=image,
+                seg_channel=seg_ch,
+                ch_cptsa=p["ch_cptsa"],
+                ch_mcherry=p["ch_mcherry"],
+                ch_names=p["ch_names"],
+            )
+
+            from ._measure import measure_pvs
+
+            self.progress.emit("Measuring parasites…")
+            pixel_size = p.get("pixel_size", 0.0)
+            para_measurements = measure_pvs(
+                labels=para_labels,
+                image=image,
+                ch_cptsa=p["ch_cptsa"],
+                ch_mcherry=p["ch_mcherry"],
+                ch_names=p["ch_names"],
+                pixel_size_um=pixel_size if pixel_size > 0 else None,
+            )
+
+            n_para = len(np.unique(para_labels)) - 1
+            self.progress.emit(f"Stage H2 done: {n_para} parasites in hosts.")
+            self.finished.emit(para_labels, vacuole_map, features, para_measurements)
+        except Exception:
+            import traceback
+
+            self.error.emit(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
 
@@ -1717,10 +1859,184 @@ class PeredoxWidget(QWidget):
     # ── Placeholders completed in Tasks 10–11 ────────────────────────────────
 
     def _run_host_stage2(self) -> None:
-        self._log_msg("Stage H2 not implemented yet (Task 10).")
+        if self._host_labels is None or self._host_labels.max() == 0:
+            self._log_msg("Segment and review host cells first.")
+            return
+        try:
+            image = self._get_image_array()
+        except RuntimeError as exc:
+            self._log_msg(f"Error: {exc}")
+            return
+
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[self._ch_cptsa.value()] = "cptsa"
+        ch_names[self._ch_mcherry.value()] = "mcherry"
+
+        # Parasite/vacuole gates come from the Setup tab (PV scale), NOT the
+        # host-area gates — Stage H2 is the existing PV pipeline (spec §4).
+        min_area_px, max_area_px = self._pixel_area_limits()
+        diameter = self._diameter.value()
+
+        params = {
+            "image": image,
+            "host_labels": self._host_labels,
+            "seg_ch": self._seg_ch.value(),
+            "seg_backend": self._seg_backend.currentIndex(),
+            "annot_dir": self._annot_dir.text(),
+            "ch_cptsa": self._ch_cptsa.value(),
+            "ch_mcherry": self._ch_mcherry.value(),
+            "ch_names": ch_names,
+            "pixel_size": self._pixel_size.value(),
+            "vac_min_area_px": min_area_px,
+            "vac_max_area_px": max_area_px,
+            "min_area_px": min_area_px,
+            "max_area_px": max_area_px,
+            "max_eccentricity": self._max_eccentricity.value(),
+            "min_solidity": self._min_solidity.value(),
+            "use_composite": self._use_composite.isChecked(),
+            "diameter": float(diameter) if diameter > 0 else None,
+            "flow_threshold": self._flow_thresh.value(),
+            "cellprob_threshold": self._cellprob_thresh.value(),
+            "threshold_method": self._thresh_method.currentText(),
+            "threshold_channel": self._thresh_channel.value(),
+            "threshold_value": self._thresh_value.value(),
+            "threshold_percentile": self._thresh_percentile.value(),
+        }
+
+        self._btn_host_stage2.setEnabled(False)
+        self._btn_host_stage2.setText("Running…")
+        self._lbl_host_stage2.setText("Detecting parasites in hosts…")
+
+        if self._seg_backend.currentIndex() == 0:
+            from ._segment import preload_model
+
+            self._log_msg(preload_model())
+
+        self._host_thread = QThread()
+        self._host_worker = _HostParasiteWorker(params)
+        self._host_worker.moveToThread(self._host_thread)
+        self._host_thread.started.connect(self._host_worker.run)
+        self._host_worker.finished.connect(self._on_host_stage2_done)
+        self._host_worker.error.connect(self._on_host_worker_error)
+        self._host_worker.progress.connect(self._log_msg)
+        self._host_worker.finished.connect(self._host_thread.quit)
+        self._host_worker.error.connect(self._host_thread.quit)
+        self._host_thread.start()
+
+    def _on_host_stage2_done(
+        self,
+        para_labels: np.ndarray,
+        vacuole_map: dict,
+        features,
+        para_measurements,
+    ) -> None:
+        self._host_para_labels = para_labels
+        self._host_vac_map = vacuole_map
+        self._host_features = features
+        self._host_para_measurements = para_measurements
+        stem = self._image_stem
+
+        layer_name = f"{stem}_host_parasites"
+        if layer_name in self._viewer.layers:
+            self._viewer.layers[layer_name].data = para_labels
+        else:
+            self._viewer.add_labels(para_labels, name=layer_name)
+
+        n_para = len(np.unique(para_labels)) - 1
+        self._lbl_host_stage2.setText(f"Found {n_para} parasites in hosts.")
+        self._btn_host_stage2.setEnabled(True)
+        self._btn_host_stage2.setText("▶ Segment parasites in hosts")
+        self._btn_host_review_para.setEnabled(True)
+        self._btn_host_measure.setEnabled(True)
+        self._lbl_host_measure.setText("Ready — assign parasites and measure hosts.")
 
     def _open_host_parasite_curation(self) -> None:
-        self._log_msg("Host parasite curation not implemented yet (Task 10).")
+        if self._host_para_labels is None:
+            self._log_msg("Run Stage H2 first.")
+            return
+        try:
+            image = self._get_image_array()
+        except RuntimeError:
+            image = np.zeros((*self._host_para_labels.shape, 2), dtype=np.float32)
+
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[self._ch_cptsa.value()] = "cptsa"
+        ch_names[self._ch_mcherry.value()] = "mcherry"
+        px = self._pixel_size.value()
+
+        from ._curation import CurationWidget
+
+        layer_name = f"{self._image_stem}_host_parasites"
+        self._host_para_curation_win = CurationWidget(
+            labels=self._host_para_labels,
+            image=image,
+            measurements=self._host_para_measurements,
+            ch_cptsa=self._ch_cptsa.value(),
+            ch_mcherry=self._ch_mcherry.value(),
+            ch_names=ch_names,
+            pixel_size_um=px if px > 0 else None,
+            vacuole_assignments=self._host_vac_map if self._host_vac_map else None,
+            on_save=self._on_host_parasite_curation_saved,
+            viewer=self._viewer,
+            labels_layer_name=layer_name,
+            parent=None,
+        )
+        self._host_para_curation_win.setWindowTitle(
+            "Peredox — Parasite Review (Stage H2)"
+        )
+        self._host_para_curation_win.resize(380, 620)
+        self._host_para_curation_win.show()
+
+    def _on_host_parasite_curation_saved(
+        self, decisions: dict, vacuole_assignments: dict | None = None
+    ) -> None:
+        """
+        Persist parasite decisions from host mode.
+
+        Parasite appearance is the same task as PV mode, so decisions feed the
+        SAME curated_features.csv / RF classifier (spec §4).  StarDist training
+        pairs are NOT saved from host mode: the host-masked image (zeroed
+        outside hosts) is not representative of PV-mode inputs.
+        """
+        from ._io import append_curated_annotations
+        from ._learning import train_classifier
+
+        annot_dir = self._annot_dir.text()
+        csv_path = append_curated_annotations(
+            decisions=decisions,
+            features=self._host_features if self._host_features is not None else {},
+            image_stem=f"{self._image_stem}_host",
+            annotations_dir=annot_dir,
+            vacuole_assignments=vacuole_assignments,
+        )
+        n_dec = sum(1 for v in decisions.values() if v in (0, 1))
+        self._log_msg(f"Saved {n_dec} parasite annotations → {csv_path}")
+
+        if vacuole_assignments:
+            self._host_vac_map = dict(vacuole_assignments)
+
+        # Drop rejected parasites from the working labels
+        rejected = {pid for pid, dec in decisions.items() if dec == 0}
+        if rejected and self._host_para_labels is not None:
+            for pid in rejected:
+                self._host_para_labels[self._host_para_labels == pid] = 0
+            self._host_vac_map = {
+                pid: vid
+                for pid, vid in self._host_vac_map.items()
+                if pid not in rejected
+            }
+            layer_name = f"{self._image_stem}_host_parasites"
+            if layer_name in self._viewer.layers:
+                self._viewer.layers[layer_name].data = self._host_para_labels
+
+        clf = train_classifier(csv_path)
+        if clf is not None:
+            self._classifier = clf
+            self._log_msg("Classifier retrained.")
+        self._update_clf_status()
+        self._lbl_host_measure.setText("Parasites curated — ready to measure.")
 
     def _run_host_measure(self) -> None:
         self._log_msg("Stage H3 not implemented yet (Task 11).")
