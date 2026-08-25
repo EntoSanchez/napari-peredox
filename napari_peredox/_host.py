@@ -59,3 +59,69 @@ def clip_bright(channel: np.ndarray, percentile: float = 99.0) -> np.ndarray:
     cutoff = np.float32(np.percentile(nonzero, percentile))
     np.clip(out, None, cutoff, out=out)
     return out
+
+
+def assign_to_hosts(
+    para_labels: np.ndarray,
+    host_labels: np.ndarray,
+    vacuole_map: dict[int, int] | None = None,
+) -> tuple[dict[int, int], dict[int, int], list[int]]:
+    """
+    Assign each parasite (and vacuole) to the host cell it overlaps most.
+
+    Majority pixel overlap decides ownership.  np.bincount + argmax makes the
+    tie-break deterministic: equal counts resolve to the lowest index, i.e.
+    background (0) first, then the lowest host ID.  A parasite whose plurality
+    value is background is *dropped* — after Stage H2 masking this can only
+    happen at mask edges following curation redraws.
+
+    Parameters
+    ----------
+    para_labels : np.ndarray (H, W) int32
+        Parasite label image (0 = background).
+    host_labels : np.ndarray (H, W) int32
+        Accepted host label image (0 = background).
+    vacuole_map : dict {parasite_label → vacuole_id}, optional
+        Stage 2 grouping.  When given, each vacuole is assigned to the host
+        holding the majority of its member-parasite pixels.
+
+    Returns
+    -------
+    para_to_host : dict {parasite_label → host_id}
+    vac_to_host : dict {vacuole_id → host_id}   (empty if vacuole_map is None)
+    dropped : list[int]
+        Parasite labels whose plurality pixel was background.
+    """
+    from collections import defaultdict
+
+    from skimage.measure import regionprops
+
+    para_to_host: dict[int, int] = {}
+    dropped: list[int] = []
+    # Per-vacuole pixel counts per host, accumulated across member parasites
+    vac_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+    for rp in regionprops(para_labels):
+        mask = para_labels[rp.slice] == rp.label
+        host_vals = host_labels[rp.slice][mask]
+        counts = np.bincount(host_vals)
+        winner = int(np.argmax(counts))
+        if winner == 0:
+            dropped.append(int(rp.label))
+        else:
+            para_to_host[int(rp.label)] = winner
+
+        if vacuole_map is not None:
+            vac_id = vacuole_map.get(int(rp.label))
+            if vac_id is not None:
+                for hid in np.nonzero(counts)[0]:
+                    if hid != 0:
+                        vac_counts[int(vac_id)][int(hid)] += int(counts[hid])
+
+    vac_to_host: dict[int, int] = {}
+    for vac_id, cmap in vac_counts.items():
+        # max count wins; ties resolve to the lowest host ID
+        best_host = min(cmap, key=lambda hid: (-cmap[hid], hid))
+        vac_to_host[vac_id] = best_host
+
+    return para_to_host, vac_to_host, dropped
