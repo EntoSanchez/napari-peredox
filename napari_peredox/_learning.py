@@ -251,16 +251,20 @@ def train_classifier(csv_path: str | Path) -> object | None:
     return clf
 
 
-def load_classifier(annotations_dir: str | Path) -> object | None:
+def load_classifier(
+    annotations_dir: str | Path,
+    filename: str = "curated_features.joblib",
+) -> object | None:
     """
     Load a previously trained classifier from the annotations directory.
 
-    Returns None if no model file is found (i.e. classifier has never been
-    trained or the annotations dir is new).
+    `filename` selects which model to load — the PV classifier by default,
+    or "curated_host_features.joblib" for the host-cell classifier.
+    Returns None if no model file is found.
     """
     import joblib
 
-    model_path = Path(annotations_dir) / "curated_features.joblib"
+    model_path = Path(annotations_dir) / filename
     if model_path.exists():
         return joblib.load(model_path)
     return None

@@ -104,6 +104,7 @@ def append_curated_annotations(
     image_stem: str,
     annotations_dir: str | Path,
     vacuole_assignments: dict[int, int] | None = None,
+    csv_name: str = "curated_features.csv",
 ) -> Path:
     """
     Append accept/reject decisions (with features) to the running annotation CSV.
@@ -138,7 +139,7 @@ def append_curated_annotations(
     """
     annotations_dir = Path(annotations_dir)
     annotations_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = annotations_dir / "curated_features.csv"
+    csv_path = annotations_dir / csv_name
 
     # ── Step 1: build the new rows ────────────────────────────────────────────
     # Only include rows where the user made an actual decision (1 or 0)
