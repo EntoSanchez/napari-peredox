@@ -398,6 +398,7 @@ class _BatchWorker(QObject):
         try:
             p = self.params
             source_type: str = p.get("source_type", "nd2")
+            analysis_mode: str = p.get("analysis_mode", "pv")
             treatment: str = p["treatment"]
             cell_line: str = p["cell_line"]
             replicate: int = p["replicate"]
@@ -440,6 +441,7 @@ class _BatchWorker(QObject):
             mask_dir.mkdir(parents=True, exist_ok=True)
 
             curation_list: list[dict] = []  # per-position data for curation gallery
+            host_results: dict = {}  # (file_stem, pos_name) -> {"hosts": df, "parasites": df}
 
             # ── Build the list of (file_stem, pos_name, image, px_um) ─────────
             # pixel_size from UI takes priority; 0 = try to read from metadata.
@@ -530,6 +532,21 @@ class _BatchWorker(QObject):
                             total,
                             f"    WARNING: could not save MIP: {exc}",
                         )
+
+                if analysis_mode == "host":
+                    self._process_host_position(
+                        p,
+                        image,
+                        file_stem,
+                        pos_name,
+                        file_px,
+                        pos_idx,
+                        total,
+                        mask_dir,
+                        host_results,
+                        curation_list,
+                    )
+                    continue
 
                 # ── Stage 1: detect whole vacuoles ───────────────────────────
                 if file_px > 0:
@@ -645,10 +662,197 @@ class _BatchWorker(QObject):
 
             # Worker emits an empty DataFrame for now — results are built during
             # interactive curation and saved via _save_accepted_results.
-            self.finished.emit(pd.DataFrame(), curation_list)
+            if analysis_mode == "host":
+                self.finished.emit(host_results, curation_list)
+            else:
+                self.finished.emit(pd.DataFrame(), curation_list)
 
         except Exception:
             self.error.emit(traceback.format_exc())
+
+    def _process_host_position(
+        self,
+        p,
+        image,
+        file_stem,
+        pos_name,
+        file_px,
+        pos_idx,
+        total,
+        mask_dir,
+        host_results,
+        curation_list,
+    ):
+        """Full auto host pipeline for one position: H1 → H2 → H3 (spec §5)."""
+        from ._host import assign_to_hosts, measure_hosts, segment_host_cells
+        from ._measure import measure_pvs
+        from ._segment import segment_parasites_in_vacuoles, segment_pvs
+
+        safe_pos = _safe_filename(pos_name)
+        ch_cptsa = p.get("ch_cptsa", 0)
+        ch_mcherry = p.get("ch_mcherry", 1)
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[ch_cptsa] = "cptsa"
+        ch_names[ch_mcherry] = "mcherry"
+
+        if file_px > 0:
+            host_min_px = p["host_min_area_um2"] / (file_px**2)
+            host_max_px = p["host_max_area_um2"] / (file_px**2)
+            vac_min_px = p.get("vac_min_area_um2", 20.0) / (file_px**2)
+            vac_max_px = p.get("vac_max_area_um2", 2000.0) / (file_px**2)
+        else:
+            host_min_px, host_max_px = 0.0, 1e9
+            vac_min_px, vac_max_px = 0.0, 1e9
+
+        # ── Stage H1: hosts (+ optional host classifier) ─────────────────────
+        host_labels, _, hstats = segment_host_cells(
+            image=image,
+            channel_index=p.get("host_ch", ch_mcherry),
+            clip_percentile=p.get("clip_percentile", 99.0),
+            diameter=p.get("diameter"),
+            flow_threshold=p.get("flow_threshold", 0.4),
+            cellprob_threshold=p.get("cellprob_threshold", 0.0),
+            min_area_px=host_min_px,
+            max_area_px=host_max_px,
+        )
+        host_clf = p.get("host_classifier")
+        if host_clf is not None and host_labels.max() > 0:
+            from ._learning import extract_features
+            from ._segment import apply_classifier_filter
+
+            feats = extract_features(
+                labels=host_labels,
+                image=image,
+                seg_channel=p.get("host_ch", ch_mcherry),
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                ch_names=ch_names,
+            )
+            host_labels = apply_classifier_filter(host_labels, feats, host_clf)
+        n_hosts = len(np.unique(host_labels)) - 1
+        self.progress.emit(
+            pos_idx,
+            total,
+            f"    Hosts: {hstats['total_raw']} raw → {n_hosts} kept.",
+        )
+        if n_hosts == 0:
+            self.progress.emit(pos_idx, total, "    No hosts — position skipped.")
+            return
+
+        # ── Stage H2: parasites inside hosts (auto) ──────────────────────────
+        masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
+        vac_labels, _, _ = segment_pvs(
+            image=masked,
+            channel_index=p.get("seg_ch", 0),
+            use_composite=p.get("use_composite", False),
+            min_area_px=vac_min_px,
+            max_area_px=vac_max_px,
+            max_eccentricity=p.get("max_eccentricity", 0.85),
+            min_solidity=p.get("min_solidity", 0.70),
+            diameter=None,
+            flow_threshold=p.get("flow_threshold", 0.4),
+            cellprob_threshold=p.get("cellprob_threshold", 0.0),
+            threshold_method=p.get("threshold_method", "none"),
+            threshold_channel=p.get("threshold_channel", 0),
+            threshold_value=p.get("threshold_value", 0.0),
+            threshold_percentile=p.get("threshold_percentile", 50.0),
+        )
+        para_labels, vac_map = segment_parasites_in_vacuoles(
+            image=masked,
+            vac_labels=vac_labels,
+            seg_channel=p.get("seg_ch", 0),
+            model=None,
+            min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
+            if file_px > 0
+            else 0.0,
+            max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
+            if file_px > 0
+            else 1e9,
+            max_eccentricity=p.get("max_eccentricity", 0.85),
+            min_solidity=p.get("min_solidity", 0.70),
+        )
+
+        # ── Stage H3: assign + measure ───────────────────────────────────────
+        para_to_host, vac_to_host, dropped = assign_to_hosts(
+            para_labels, host_labels, vac_map
+        )
+        if dropped:
+            self.progress.emit(
+                pos_idx,
+                total,
+                f"    {len(dropped)} parasite(s) without host majority dropped.",
+            )
+        hosts_df = measure_hosts(
+            host_labels=host_labels,
+            para_labels=para_labels,
+            image=image,
+            para_to_host=para_to_host,
+            vac_to_host=vac_to_host,
+            dilation_px=p.get("host_dilation_px", 3),
+            ch_cptsa=ch_cptsa,
+            ch_mcherry=ch_mcherry,
+            ch_names=ch_names,
+            pixel_size_um=file_px if file_px > 0 else None,
+        )
+        para_df = measure_pvs(
+            labels=para_labels,
+            image=image,
+            ch_cptsa=ch_cptsa,
+            ch_mcherry=ch_mcherry,
+            ch_names=ch_names,
+            pixel_size_um=file_px if file_px > 0 else None,
+        )
+        if not para_df.empty:
+            para_df["host_id"] = para_df.index.map(para_to_host)
+
+        # Experimental metadata (same tagging idea as PV mode)
+        for df in (hosts_df, para_df):
+            if df is not None and not df.empty:
+                df["file"] = file_stem
+                df["position"] = pos_name
+                df["treatment"] = p["treatment"]
+                df["cell_line"] = p["cell_line"]
+                df["replicate"] = p["replicate"]
+
+        n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
+        self.progress.emit(
+            pos_idx,
+            total,
+            f"    {len(hosts_df)} hosts ({n_inf} infected), {len(para_df)} parasites.",
+        )
+
+        # ── Persist masks; stash results + curation entry ────────────────────
+        try:
+            save_mask_tiff(
+                host_labels, mask_dir / f"{file_stem}_{safe_pos}_host_mask.tif"
+            )
+            save_mask_tiff(
+                para_labels, mask_dir / f"{file_stem}_{safe_pos}_host_para_mask.tif"
+            )
+        except Exception as exc:
+            self.progress.emit(pos_idx, total, f"    WARNING: mask save failed: {exc}")
+
+        key = (file_stem, pos_name)
+        host_results[key] = {"hosts": hosts_df, "parasites": para_df}
+        curation_list.append(
+            {
+                "mode": "host",
+                "display_name": f"{file_stem} | {pos_name}",
+                "file": file_stem,
+                "position_name": pos_name,
+                "image": image,
+                "host_labels": host_labels,
+                "para_labels": para_labels,
+                "para_to_host": para_to_host,
+                "vac_map": vac_map,
+                "file_px": file_px,
+                "treatment": p["treatment"],
+                "cell_line": p["cell_line"],
+                "replicate": p["replicate"],
+                "pos_idx": pos_idx,
+            }
+        )
 
 
 # ── Batch widget ──────────────────────────────────────────────────────────────
@@ -1409,6 +1613,28 @@ class BatchWidget(QWidget):
             "threshold_percentile": self._thresh_percentile.value(),
             "seg_backend": self._seg_backend.currentIndex(),  # 0=cpSAM, 1=StarDist
             "annot_dir": self._annot_dir.text(),
+            "analysis_mode": (
+                "host"
+                if getattr(self, "_analysis_mode", None) is not None
+                and self._analysis_mode.currentIndex() == 1
+                else "pv"
+            ),
+            "host_ch": getattr(self, "_host_ch", None).value()
+            if getattr(self, "_host_ch", None)
+            else 1,
+            "clip_percentile": getattr(self, "_host_clip_pct", None).value()
+            if getattr(self, "_host_clip_pct", None)
+            else 99.0,
+            "host_min_area_um2": getattr(self, "_host_min_area_um2", None).value()
+            if getattr(self, "_host_min_area_um2", None)
+            else 200.0,
+            "host_max_area_um2": getattr(self, "_host_max_area_um2", None).value()
+            if getattr(self, "_host_max_area_um2", None)
+            else 10000.0,
+            "host_dilation_px": getattr(self, "_host_dilation_px", None).value()
+            if getattr(self, "_host_dilation_px", None)
+            else 3,
+            "host_classifier": self._load_host_classifier_if_requested(),
         }
 
         self._btn_run.setEnabled(False)
@@ -1929,6 +2155,19 @@ class BatchWidget(QWidget):
         else:
             df.to_csv(csv_path, index=False)
             self._log_msg(f"Saved {len(df)} row(s) → {csv_path}.")
+
+    def _load_host_classifier_if_requested(self):
+        """Host classifier for batch host mode; None when unavailable/not requested."""
+        if not self._use_classifier.isChecked():
+            return None
+        from ._learning import load_classifier
+
+        clf = load_classifier(
+            self._annot_dir.text(), filename="curated_host_features.joblib"
+        )
+        if clf is None:
+            self._log_msg("No host classifier trained yet — batch runs without it.")
+        return clf
 
     def _log_msg(self, msg: str):
         self._log.append(msg)
