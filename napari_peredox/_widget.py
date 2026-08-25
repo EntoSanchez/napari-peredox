@@ -381,6 +381,8 @@ class PeredoxWidget(QWidget):
         self._host_para_measurements = None
         self._host_measurements = None
         self._host_classifier = None
+        self._host_thread: QThread | None = None
+        self._host_worker = None
 
         self._classifier = None
         self._thread: QThread | None = None
@@ -1568,16 +1570,16 @@ class PeredoxWidget(QWidget):
 
         self._log_msg(preload_model())
 
-        self._thread = QThread()
-        self._worker = _HostWorker(params)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._on_host_stage1_done)
-        self._worker.error.connect(self._on_host_worker_error)
-        self._worker.progress.connect(self._log_msg)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.error.connect(self._thread.quit)
-        self._thread.start()
+        self._host_thread = QThread()
+        self._host_worker = _HostWorker(params)
+        self._host_worker.moveToThread(self._host_thread)
+        self._host_thread.started.connect(self._host_worker.run)
+        self._host_worker.finished.connect(self._on_host_stage1_done)
+        self._host_worker.error.connect(self._on_host_worker_error)
+        self._host_worker.progress.connect(self._log_msg)
+        self._host_worker.finished.connect(self._host_thread.quit)
+        self._host_worker.error.connect(self._host_thread.quit)
+        self._host_thread.start()
 
     def _on_host_stage1_done(
         self, raw_host_labels: np.ndarray, host_labels: np.ndarray
@@ -1607,9 +1609,6 @@ class PeredoxWidget(QWidget):
         self._btn_host_stage1.setEnabled(True)
         self._btn_host_stage1.setText("▶ Segment host cells")
         self._btn_host_review.setEnabled(True)
-        self._btn_host_stage2.setEnabled(n > 0)
-        if n == 0:
-            self._lbl_host_stage2.setText("No hosts found — Stage H2 unavailable.")
 
     def _on_host_worker_error(self, msg: str) -> None:
         self._log_msg(f"Error:\n{msg}")
