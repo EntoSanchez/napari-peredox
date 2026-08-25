@@ -891,6 +891,11 @@ class BatchWidget(QWidget):
         # the user reviews and explicitly saves the filtered version.
         self._result_df: pd.DataFrame | None = None
 
+        # Host mode: {(file, position_name) -> {"hosts": df, "parasites": df}}
+        # populated by _on_finished (host branch) and refined per-position by
+        # _open_host_position_curation as the user reviews host masks.
+        self._host_results: dict[tuple, dict] = {}
+
         # Maps (file_stem, position_name) → {parasite_label: 0/1}
         # Only positions the user has opened in the curation gallery appear here.
         # Positions NOT present default to "keep all" when saving.
@@ -923,6 +928,18 @@ class BatchWidget(QWidget):
         layout = QVBoxLayout(w)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
+
+        mode_box = QGroupBox("Analysis mode")
+        mode_layout = QVBoxLayout(mode_box)
+        self._analysis_mode = QComboBox()
+        self._analysis_mode.addItems(["Vacuoles / PVs", "Host cells"])
+        self._analysis_mode.setToolTip(
+            "Vacuoles/PVs — existing two-stage PV pipeline.\n"
+            "Host cells — segment Peredox-expressing hosts, then parasites\n"
+            "inside them; outputs hosts.csv + host_parasites.csv."
+        )
+        mode_layout.addWidget(self._analysis_mode)
+        layout.insertWidget(0, mode_box)
 
         src_box = QGroupBox("Image source")
         src_layout = QVBoxLayout(src_box)
@@ -1197,6 +1214,49 @@ class BatchWidget(QWidget):
         filt_form.addRow("Shape:", shape_row)
 
         layout.addWidget(filt_box)
+
+        # Host mode settings (enabled only when Analysis mode == "Host cells")
+        host_box = QGroupBox("Host mode settings")
+        host_form = QFormLayout(host_box)
+        host_form.setContentsMargins(6, 6, 6, 6)
+
+        self._host_ch = QSpinBox()
+        self._host_ch.setRange(0, 15)
+        self._host_ch.setValue(1)
+        host_form.addRow("Host channel:", self._host_ch)
+
+        self._host_clip_pct = QDoubleSpinBox()
+        self._host_clip_pct.setRange(50.0, 100.0)
+        self._host_clip_pct.setDecimals(1)
+        self._host_clip_pct.setValue(99.0)
+        host_form.addRow("Clip percentile:", self._host_clip_pct)
+
+        self._host_min_area_um2 = QDoubleSpinBox()
+        self._host_min_area_um2.setRange(0.0, 1e6)
+        self._host_min_area_um2.setDecimals(0)
+        self._host_min_area_um2.setValue(200.0)
+        self._host_max_area_um2 = QDoubleSpinBox()
+        self._host_max_area_um2.setRange(0.0, 1e6)
+        self._host_max_area_um2.setDecimals(0)
+        self._host_max_area_um2.setValue(10000.0)
+        host_area_row = QHBoxLayout()
+        host_area_row.addWidget(QLabel("min:"))
+        host_area_row.addWidget(self._host_min_area_um2)
+        host_area_row.addWidget(QLabel("max:"))
+        host_area_row.addWidget(self._host_max_area_um2)
+        host_form.addRow("Host area (µm²):", host_area_row)
+
+        self._host_dilation_px = QSpinBox()
+        self._host_dilation_px.setRange(0, 50)
+        self._host_dilation_px.setValue(3)
+        host_form.addRow("Parasite exclusion buffer (px):", self._host_dilation_px)
+
+        host_box.setEnabled(False)
+        self._analysis_mode.currentIndexChanged.connect(
+            lambda i: host_box.setEnabled(i == 1)
+        )
+        layout.addWidget(host_box)
+
         layout.addStretch()
         return w
 
@@ -1687,7 +1747,7 @@ class BatchWidget(QWidget):
         if total > 0:
             self._progress_bar.setValue(int(100 * current / total))
 
-    def _on_finished(self, result: pd.DataFrame, curation_list: list):
+    def _on_finished(self, result: pd.DataFrame | dict, curation_list: list):
         """
         Called in the main thread when the worker completes.
 
@@ -1695,7 +1755,32 @@ class BatchWidget(QWidget):
         curation gallery and click 'Save accepted results CSV' to write the
         final output.  This prevents false positives from polluting the CSV
         before manual QC.
+
+        `result` is a `pd.DataFrame` in PV mode (all detected parasites) or a
+        `dict` keyed by `(file, position_name) -> {"hosts", "parasites"}` in
+        host mode (see `_process_host_position`).
         """
+        if curation_list and curation_list[0].get("mode") == "host":
+            self._progress_bar.setValue(100)
+            self._host_results = result  # dict {(file, pos) -> {"hosts", "parasites"}}
+            self._result_df = None
+            self._curation_decisions = {}
+            self._curation_data = curation_list
+            self._curation_combo.clear()
+            for item in curation_list:
+                self._curation_combo.addItem(item["display_name"])
+            self._curation_combo.setEnabled(True)
+            self._btn_curate.setEnabled(True)
+            self._btn_save_results.setEnabled(True)
+            self._update_review_status()
+            n_hosts = sum(len(v["hosts"]) for v in result.values())
+            self._log_msg(
+                f"Host batch complete — {len(curation_list)} position(s), "
+                f"{n_hosts} host cells measured.\n"
+                f"Review positions to reject bad host masks, then save."
+            )
+            return
+
         self._progress_bar.setValue(100)
 
         # Store raw results and reset any prior curation decisions
@@ -1759,6 +1844,14 @@ class BatchWidget(QWidget):
         Pass 2 — CurationWidget: after saving vacuole decisions, opens the
                   per-vacuole parasite gallery for individual parasite review.
         """
+        idx = self._curation_combo.currentIndex()
+        if idx < 0 or idx >= len(self._curation_data):
+            return
+        item = self._curation_data[idx]
+        if item.get("mode") == "host":
+            self._open_host_position_curation(item)
+            return
+
         idx = self._curation_combo.currentIndex()
         if idx < 0 or idx >= len(self._curation_data):
             return
@@ -2136,8 +2229,112 @@ class BatchWidget(QWidget):
         else:
             vac_win.show()
 
+    def _open_host_position_curation(self, item: dict):
+        """Accept/reject/redraw host masks for one batch position."""
+        from ._curation import VacuoleCurationWidget
+
+        def _on_save(decisions: dict, curated_hosts: np.ndarray):
+            from ._host import assign_to_hosts, measure_hosts
+
+            hosts = curated_hosts.copy()
+            for hid, dec in decisions.items():
+                if dec == 0:
+                    hosts[hosts == hid] = 0
+            item["host_labels"] = hosts
+
+            # Recompute assignment + measurement against the curated hosts.
+            # Parasites in rejected hosts lose their majority and are dropped.
+            para_to_host, vac_to_host, _dropped = assign_to_hosts(
+                item["para_labels"], hosts, item.get("vac_map") or None
+            )
+            ch_names = {0: "ch0", 1: "ch1"}
+            ch_names[self._ch_cptsa.value()] = "cptsa"
+            ch_names[self._ch_mcherry.value()] = "mcherry"
+            file_px = item["file_px"]
+            hosts_df = measure_hosts(
+                host_labels=hosts,
+                para_labels=item["para_labels"],
+                image=item["image"],
+                para_to_host=para_to_host,
+                vac_to_host=vac_to_host,
+                dilation_px=self._host_dilation_px.value(),
+                ch_cptsa=self._ch_cptsa.value(),
+                ch_mcherry=self._ch_mcherry.value(),
+                ch_names=ch_names,
+                pixel_size_um=file_px if file_px > 0 else None,
+            )
+            from ._measure import measure_pvs
+
+            para_df = measure_pvs(
+                labels=item["para_labels"],
+                image=item["image"],
+                ch_cptsa=self._ch_cptsa.value(),
+                ch_mcherry=self._ch_mcherry.value(),
+                ch_names=ch_names,
+                pixel_size_um=file_px if file_px > 0 else None,
+            )
+            if not para_df.empty:
+                para_df["host_id"] = para_df.index.map(para_to_host)
+                para_df = para_df[para_df["host_id"].notna()]
+            for df in (hosts_df, para_df):
+                if df is not None and not df.empty:
+                    df["file"] = item["file"]
+                    df["position"] = item["position_name"]
+                    df["treatment"] = item["treatment"]
+                    df["cell_line"] = item["cell_line"]
+                    df["replicate"] = item["replicate"]
+
+            key = (item["file"], item["position_name"])
+            self._host_results[key] = {"hosts": hosts_df, "parasites": para_df}
+            self._curation_decisions[key] = dict(decisions)
+            self._update_review_status()
+            self._log_msg(
+                f"Host review saved for {item['display_name']} — "
+                f"{len(hosts_df)} hosts kept."
+            )
+
+        self._host_curation_win = VacuoleCurationWidget(
+            vac_labels=item["host_labels"],
+            image=item["image"],
+            ch_cptsa=self._ch_cptsa.value(),
+            ch_mcherry=self._ch_mcherry.value(),
+            on_save=_on_save,
+            viewer=self._viewer,
+            labels_layer_name=None,
+            object_name="host cell",
+            parent=None,
+        )
+        self._host_curation_win.setWindowTitle(f"Host Review — {item['display_name']}")
+        self._host_curation_win.resize(360, 560)
+        self._host_curation_win.show()
+
     def _save_accepted_results(self):
         """Write results.csv from measurements accumulated during curation."""
+        if getattr(self, "_host_results", None):
+            out_folder = self._pending_out_folder
+            out_folder.mkdir(parents=True, exist_ok=True)
+            hosts_all = pd.concat(
+                [
+                    v["hosts"]
+                    for v in self._host_results.values()
+                    if not v["hosts"].empty
+                ]
+            )
+            paras = [
+                v["parasites"]
+                for v in self._host_results.values()
+                if v["parasites"] is not None and not v["parasites"].empty
+            ]
+            hosts_path = out_folder / "hosts.csv"
+            hosts_all.to_csv(hosts_path)
+            self._log_msg(f"Saved {len(hosts_all)} host row(s) → {hosts_path}")
+            if paras:
+                paras_all = pd.concat(paras)
+                paras_path = out_folder / "host_parasites.csv"
+                paras_all.to_csv(paras_path)
+                self._log_msg(f"Saved {len(paras_all)} parasite row(s) → {paras_path}")
+            return
+
         if self._result_df is None or self._result_df.empty:
             self._log_msg(
                 "No results to save — complete curation for at least one position first."
