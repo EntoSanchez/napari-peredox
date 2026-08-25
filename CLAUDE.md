@@ -187,6 +187,12 @@ before segmenting).
 - `<stem>_host_parasite_labels.tif` — accepted parasite label image (kept
   separate from PV-mode `<stem>_labels.tif`). Only written when parasites exist.
 
+Rejected hosts are zeroed in place rather than removed, and accepted hosts
+keep their original cpSAM label IDs — there is no consecutive relabeling —
+so `host_id` in the CSVs always matches the label value in
+`<stem>_host_labels.tif`; this is a deliberate deviation from the spec's
+"relabeled consecutively" line.
+
 ### Host classifier files (`annotations/`)
 
 - `curated_host_features.csv` — growing host curation log (same schema
@@ -213,7 +219,7 @@ verified by running it on real images (spec §8 acceptance test).
 uv run pytest tests/ -v
 ```
 
-31 tests, all passing as of 2026-08-25.
+32 tests, all passing as of 2026-08-25.
 
 ---
 
@@ -261,7 +267,7 @@ uv run pytest tests/ -v
 - **Imports verified**: all modules import cleanly from the venv, including `_host` (`_widget`, `_batch`, `_curation`, `_host`)
 - **Host-cell analysis mode added** (`host-analysis` branch, spec
   `docs/superpowers/specs/2026-08-25-host-analysis-design.md`): see "Host
-  analysis workflow" above. `tests/` added (pytest, 31 tests passing).
+  analysis workflow" above. `tests/` added (pytest, 32 tests passing).
   Not yet run against real U2OS Peredox images end-to-end (spec §8
   acceptance test — cpSAM segmentation quality on real data — is pending
   manual verification).

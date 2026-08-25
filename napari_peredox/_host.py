@@ -202,6 +202,10 @@ def measure_hosts(
         # Every host was fully covered — measure_pvs returned an empty frame,
         # so the ratio columns never materialised.  NaN keeps the schema.
         df["ratio_intden"] = np.nan
+    if "ratio_mean" not in df.columns:
+        df["ratio_mean"] = np.nan
+    if "ratio_median" not in df.columns:
+        df["ratio_median"] = np.nan
     df = df.loc[sorted(int(i) for i in df.index)]
 
     # ── Metadata columns ─────────────────────────────────────────────────────

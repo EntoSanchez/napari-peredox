@@ -9,6 +9,7 @@ MODULES = [
     "napari_peredox._measure",
     "napari_peredox._learning",
     "napari_peredox._io",
+    "napari_peredox._host",
 ]
 
 

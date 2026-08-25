@@ -1733,6 +1733,12 @@ class PeredoxWidget(QWidget):
         self._host_vac_map = {}
         self._host_measurements = None
         self._host_review_saved = False
+        self._host_para_measurements = None
+        self._host_features = None
+        self._btn_host_stage2.setEnabled(False)
+        self._btn_host_review_para.setEnabled(False)
+        self._btn_host_measure.setEnabled(False)
+        self._btn_host_export.setEnabled(False)
         stem = self._image_stem
 
         raw_name = f"{stem}_host_candidates"
@@ -1855,12 +1861,20 @@ class PeredoxWidget(QWidget):
         self._host_para_labels = None
         self._btn_host_review_para.setEnabled(False)
         self._btn_host_measure.setEnabled(False)
+        self._host_measurements = None
+        self._host_para_measurements = None
+        self._btn_host_export.setEnabled(False)
 
     # ── Placeholders completed in Tasks 10–11 ────────────────────────────────
 
     def _run_host_stage2(self) -> None:
         if self._host_labels is None or self._host_labels.max() == 0:
             self._log_msg("Segment and review host cells first.")
+            return
+        if not self._host_review_saved:
+            self._log_msg(
+                "Save the host review first (Stage H2 runs on accepted hosts only)."
+            )
             return
         try:
             image = self._get_image_array()
@@ -1906,6 +1920,7 @@ class PeredoxWidget(QWidget):
 
         self._btn_host_stage2.setEnabled(False)
         self._btn_host_stage2.setText("Running…")
+        self._btn_host_stage1.setEnabled(False)
         self._lbl_host_stage2.setText("Detecting parasites in hosts…")
 
         if self._seg_backend.currentIndex() == 0:
@@ -1947,6 +1962,7 @@ class PeredoxWidget(QWidget):
         self._lbl_host_stage2.setText(f"Found {n_para} parasites in hosts.")
         self._btn_host_stage2.setEnabled(True)
         self._btn_host_stage2.setText("▶ Segment parasites in hosts")
+        self._btn_host_stage1.setEnabled(True)
         self._btn_host_review_para.setEnabled(True)
         self._btn_host_measure.setEnabled(True)
         self._lbl_host_measure.setText("Ready — assign parasites and measure hosts.")
@@ -2097,6 +2113,11 @@ class PeredoxWidget(QWidget):
             self._host_para_measurements["host_id"] = (
                 self._host_para_measurements.index.map(para_to_host)
             )
+            # Rejected / background-dropped parasites have no host_id (NaN) —
+            # exclude them, matching the batch path's para_to_host semantics.
+            self._host_para_measurements = self._host_para_measurements[
+                self._host_para_measurements["host_id"].notna()
+            ]
 
         n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
         n_tot = len(hosts_df)

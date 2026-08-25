@@ -534,18 +534,25 @@ class _BatchWorker(QObject):
                         )
 
                 if analysis_mode == "host":
-                    self._process_host_position(
-                        p,
-                        image,
-                        file_stem,
-                        pos_name,
-                        file_px,
-                        pos_idx,
-                        total,
-                        mask_dir,
-                        host_results,
-                        curation_list,
-                    )
+                    try:
+                        self._process_host_position(
+                            p,
+                            image,
+                            file_stem,
+                            pos_name,
+                            file_px,
+                            pos_idx,
+                            total,
+                            mask_dir,
+                            host_results,
+                            curation_list,
+                        )
+                    except Exception as exc:
+                        self.progress.emit(
+                            pos_idx,
+                            total,
+                            f"    Host pipeline failed for this position: {exc}",
+                        )
                     continue
 
                 # ── Stage 1: detect whole vacuoles ───────────────────────────
@@ -688,6 +695,14 @@ class _BatchWorker(QObject):
         from ._measure import measure_pvs
         from ._segment import segment_parasites_in_vacuoles, segment_pvs
 
+        if p.get("seg_backend", 0) == 1:
+            self.progress.emit(
+                pos_idx,
+                total,
+                "    Note: StarDist backend is not supported in batch host "
+                "mode — using cpSAM.",
+            )
+
         safe_pos = _safe_filename(pos_name)
         ch_cptsa = p.get("ch_cptsa", 0)
         ch_mcherry = p.get("ch_mcherry", 1)
@@ -744,7 +759,7 @@ class _BatchWorker(QObject):
         masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
         vac_labels, _, _ = segment_pvs(
             image=masked,
-            channel_index=p.get("seg_ch", 0),
+            channel_index=p.get("vac_seg_ch", 1),
             use_composite=p.get("use_composite", False),
             min_area_px=vac_min_px,
             max_area_px=vac_max_px,
@@ -754,7 +769,7 @@ class _BatchWorker(QObject):
             flow_threshold=p.get("flow_threshold", 0.4),
             cellprob_threshold=p.get("cellprob_threshold", 0.0),
             threshold_method=p.get("threshold_method", "none"),
-            threshold_channel=p.get("threshold_channel", 0),
+            threshold_channel=p.get("threshold_channel", p.get("vac_seg_ch", 1)),
             threshold_value=p.get("threshold_value", 0.0),
             threshold_percentile=p.get("threshold_percentile", 50.0),
         )
@@ -781,7 +796,8 @@ class _BatchWorker(QObject):
             self.progress.emit(
                 pos_idx,
                 total,
-                f"    {len(dropped)} parasite(s) without host majority dropped.",
+                f"    {len(dropped)} parasite(s) without host majority dropped: "
+                f"{sorted(dropped)}",
             )
         hosts_df = measure_hosts(
             host_labels=host_labels,
@@ -1760,7 +1776,18 @@ class BatchWidget(QWidget):
         `dict` keyed by `(file, position_name) -> {"hosts", "parasites"}` in
         host mode (see `_process_host_position`).
         """
-        if curation_list and curation_list[0].get("mode") == "host":
+        if isinstance(result, dict):
+            # Host mode: `result` is {(file, pos) -> {"hosts", "parasites"}}.
+            # An empty dict means every position was skipped (no hosts found
+            # or the per-position pipeline failed) — curation_list is then
+            # empty too, so there's nothing to review or save.
+            if not result:
+                self._result_df = None
+                self._progress_bar.setValue(100)
+                self._log_msg(
+                    "Host batch complete — no host cells detected in any position."
+                )
+                return
             self._progress_bar.setValue(100)
             self._host_results = result  # dict {(file, pos) -> {"hosts", "parasites"}}
             self._result_df = None
@@ -2332,11 +2359,15 @@ class BatchWidget(QWidget):
                 if v["parasites"] is not None and not v["parasites"].empty
             ]
             hosts_path = out_folder / "hosts.csv"
+            if hosts_path.exists():
+                self._log_msg(f"Overwriting existing {hosts_path.name}.")
             hosts_all.to_csv(hosts_path)
             self._log_msg(f"Saved {len(hosts_all)} host row(s) → {hosts_path}")
             if paras:
                 paras_all = pd.concat(paras)
                 paras_path = out_folder / "host_parasites.csv"
+                if paras_path.exists():
+                    self._log_msg(f"Overwriting existing {paras_path.name}.")
                 paras_all.to_csv(paras_path)
                 self._log_msg(f"Saved {len(paras_all)} parasite row(s) → {paras_path}")
             return
