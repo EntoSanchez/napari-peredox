@@ -216,3 +216,73 @@ def measure_hosts(
 
     df.index.name = "host_id"
     return df
+
+
+def segment_host_cells(
+    image: np.ndarray,
+    channel_index: int = 1,
+    clip_percentile: float = 99.0,
+    diameter: float | None = None,
+    flow_threshold: float = 0.4,
+    cellprob_threshold: float = 0.0,
+    min_area_px: float = 0.0,
+    max_area_px: float = 1e9,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Stage H1: segment host cells with cpSAM on a bright-clipped channel.
+
+    Whole-cell segmentation is cpSAM's native task; the only special handling
+    is clip_bright(), which stops much-brighter intracellular parasites from
+    compressing host contrast during model normalisation.  Only the area gate
+    is applied afterwards — spread U2OS fail the PV eccentricity/solidity
+    gates, so those are disabled (spec §4 H1).
+
+    Note: cpSAM may propose a bright vacuole inside a NON-expressing cell as a
+    small "host" — the min-area gate is what rejects these (spec §4 H1), so
+    keep min_area_px well above any vacuole footprint.
+
+    Returns
+    -------
+    (filtered_labels, raw_labels, stats) — same convention as segment_pvs().
+    stats additionally has clip_percentile, clip_value, clip_skipped.
+    """
+    from ._segment import _filter_by_morphology, _get_model
+
+    if image.ndim == 3:
+        chan = image[..., channel_index].astype(np.float32)
+    elif image.ndim == 2:
+        chan = image.astype(np.float32)
+    else:
+        raise ValueError(f"Expected 2-D or 3-D array, got shape {image.shape}")
+
+    clipped = clip_bright(chan, clip_percentile)
+    if clipped.max() > clipped.min():
+        seg_img = clipped
+        clip_skipped = False
+    else:
+        # Clipping flattened the image (or it was already flat) — cpSAM would
+        # see no contrast, so fall back to the unclipped channel.
+        seg_img = chan
+        clip_skipped = True
+
+    model = _get_model()
+    masks, _, _ = model.eval(
+        seg_img,
+        diameter=diameter,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        normalize=True,
+    )
+    raw_labels = np.asarray(masks).astype(np.int32)
+
+    filtered, stats = _filter_by_morphology(
+        raw_labels, min_area_px, max_area_px, 1.0, 0.0
+    )
+    stats.update(
+        {
+            "clip_percentile": float(clip_percentile),
+            "clip_value": float(seg_img.max()),
+            "clip_skipped": clip_skipped,
+        }
+    )
+    return filtered, raw_labels, stats
