@@ -100,7 +100,7 @@ The Stage-H1 labels open in the single-object curation gallery
 
 - keeps accepted hosts only (relabeled consecutively),
 - appends decisions + features to `curated_host_features.csv`,
-- retrains/updates `host_classifier.joblib` when both classes have enough
+- retrains/updates `curated_host_features.joblib` when both classes have enough
   examples (same thresholds as the PV classifier).
 
 ### Stage H2 — parasites within hosts
@@ -186,7 +186,7 @@ annotations/
   curated_features.csv          (existing, PV)
   curated_features.joblib       (existing, PV)
   curated_host_features.csv     (new)
-  host_classifier.joblib        (new)
+  curated_host_features.joblib        (new)
   results/
     <stem>_host_measurements.csv
     <stem>_host_parasite_measurements.csv
@@ -199,7 +199,7 @@ annotations/
 Identical machinery to the PV classifier: `extract_features()` over host
 labels, decisions appended to `curated_host_features.csv`,
 RandomForest trained by `train_classifier()` once ≥ 10 examples with both
-classes exist, saved as `host_classifier.joblib`, applied in Stage H1 when the
+classes exist, saved as `curated_host_features.joblib`, applied in Stage H1 when the
 "use classifier" checkbox is on. Host and PV training data never mix.
 
 ## 7. Error handling
