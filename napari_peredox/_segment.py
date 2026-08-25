@@ -290,7 +290,6 @@ def segment_pvs(
     model = _get_model()
     masks, _, _ = model.eval(
         seg_img,
-        channels=None,
         diameter=diameter,
         flow_threshold=flow_threshold,
         cellprob_threshold=cellprob_threshold,
@@ -312,6 +311,40 @@ def segment_pvs(
 
     filter_stats.update(filter_stats_thresh)
     return filtered_labels, raw_labels, filter_stats
+
+
+def filter_labels(
+    labels: np.ndarray,
+    min_area_px: float = 0.0,
+    max_area_px: float = 1e9,
+    max_eccentricity: float = 0.95,
+    min_solidity: float = 0.60,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Apply morphology filtering to a pre-segmented label array.
+
+    Identical gate logic to segment_pvs() but skips the Cellpose call.
+    Used by the StarDist inference path so both backends produce the same
+    filter stats format downstream.
+
+    Returns
+    -------
+    filtered_labels, raw_labels, filter_stats
+        Same tuple format as segment_pvs().
+    """
+    raw_labels = labels.astype(np.int32).copy()
+    filtered, stats = _filter_by_morphology(
+        raw_labels, min_area_px, max_area_px, max_eccentricity, min_solidity
+    )
+    stats.update(
+        {
+            "threshold_method": "none",
+            "threshold_cutoff": 0.0,
+            "pct_kept": 100.0,
+            "threshold_skipped": False,
+        }
+    )
+    return filtered, raw_labels, stats
 
 
 def apply_classifier_filter(
@@ -597,3 +630,161 @@ def _relabel(labels: np.ndarray) -> np.ndarray:
     # Convert to binary (any non-zero = foreground) then re-label
     binary = labels > 0
     return sk_label(binary, connectivity=2).astype(np.int32)
+
+
+# ── Two-stage pipeline: Stage 2 ───────────────────────────────────────────────
+
+
+def segment_parasites_in_vacuoles(
+    image: np.ndarray,
+    vac_labels: np.ndarray,
+    seg_channel: int = 0,
+    model=None,
+    min_area_px: float = 0.0,
+    max_area_px: float = 1e9,
+    max_eccentricity: float = 0.95,
+    min_solidity: float = 0.60,
+    pad: int = 8,
+    progress_cb=None,
+) -> tuple[np.ndarray, dict[int, int]]:
+    """
+    Stage 2: detect individual parasites within each confirmed vacuole.
+
+    For every non-zero label in *vac_labels*:
+      1. Crop the image to the vacuole bounding box (+ *pad* pixels).
+      2. Run StarDist (if *model* provided) or cpSAM on the crop.
+      3. Clip results to the vacuole mask (non-overlapping: pixels are
+         claimed by whichever parasite was detected there first; ties broken
+         by label order).  Any detected region that falls entirely outside the
+         vacuole is discarded.
+      4. Apply morphology filters (area, eccentricity, solidity).
+      5. Subtract newly accepted pixels from neighbouring parasite masks to
+         enforce non-overlapping boundaries (option B from design doc).
+      6. Paste accepted parasites into the full-size output with globally
+         unique label IDs.
+
+    Parameters
+    ----------
+    image : np.ndarray (H, W, C) float32
+    vac_labels : np.ndarray (H, W) int32
+        Stage 1 output — one integer ID per confirmed vacuole.
+    seg_channel : int
+        Image channel used for segmentation.
+    model : StarDist2D or None
+        Loaded parasite StarDist model.  When None falls back to cpSAM.
+    min_area_px, max_area_px, max_eccentricity, min_solidity : float
+        Morphology filter thresholds (same as segment_pvs).
+    pad : int
+        Pixels of padding added around each vacuole crop.
+    progress_cb : callable(str) | None
+        Called with status strings.
+
+    Returns
+    -------
+    para_labels : np.ndarray (H, W) int32
+        Full-size label image with one ID per individual parasite.
+    vacuole_map : dict {parasite_label → vacuole_id}
+        Directly derived from stage 1 — no dilation needed.
+    """
+    from skimage.measure import regionprops
+
+    def log(msg: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+
+    H, W = vac_labels.shape
+    para_labels = np.zeros((H, W), dtype=np.int32)
+    vacuole_map: dict[int, int] = {}
+    next_id = 1
+
+    vac_ids = [int(v) for v in np.unique(vac_labels) if v != 0]
+    log(f"Stage 2: detecting parasites in {len(vac_ids)} vacuoles…")
+
+    for vac_id in vac_ids:
+        vac_mask = vac_labels == vac_id
+        ys, xs = np.where(vac_mask)
+        if len(ys) == 0:
+            continue
+
+        # ── Crop ──────────────────────────────────────────────────────────────
+        y0 = max(int(ys.min()) - pad, 0)
+        y1 = min(int(ys.max()) + pad + 1, H)
+        x0 = max(int(xs.min()) - pad, 0)
+        x1 = min(int(xs.max()) + pad + 1, W)
+
+        crop_img = image[y0:y1, x0:x1]
+        crop_vac = vac_mask[y0:y1, x0:x1]
+
+        # ── Detect ────────────────────────────────────────────────────────────
+        if model is not None:
+            from ._stardist import predict_stardist
+
+            crop_raw = predict_stardist(crop_img, model, seg_channel)
+        else:
+            # cpSAM fallback — run on the crop
+            cp_model = _get_model()
+            ch = min(seg_channel, crop_img.shape[-1] - 1) if crop_img.ndim == 3 else 0
+            seg_input = crop_img[..., ch] if crop_img.ndim == 3 else crop_img
+            crop_raw, _, _ = cp_model.eval(
+                seg_input.astype(np.float32),
+                diameter=None,
+            )
+            crop_raw = np.asarray(crop_raw).astype(np.int32)
+
+        # ── Clip to vacuole mask ──────────────────────────────────────────────
+        # Keep only pixels inside the vacuole; zero everything outside.
+        crop_clipped = crop_raw.copy()
+        crop_clipped[~crop_vac] = 0
+
+        # Discard any label that has NO pixels inside the vacuole after clipping
+        for lbl in np.unique(crop_raw):
+            if lbl == 0:
+                continue
+            if not np.any(crop_clipped == lbl):
+                crop_clipped[crop_raw == lbl] = 0
+
+        # ── Morphology filter ─────────────────────────────────────────────────
+        keep_labels: list[int] = []
+        for rp in regionprops(crop_clipped):
+            if rp.area < min_area_px or rp.area > max_area_px:
+                continue
+            if rp.eccentricity > max_eccentricity:
+                continue
+            if rp.solidity < min_solidity:
+                continue
+            keep_labels.append(rp.label)
+
+        if not keep_labels:
+            continue
+
+        # ── Non-overlapping enforcement (option B) ────────────────────────────
+        # Build a final crop label image where each pixel belongs to exactly
+        # one parasite.  If two detected regions would overlap (shouldn't
+        # happen after clipping, but guards against cpSAM edge cases), the
+        # pixel goes to the region with the larger area.
+        sorted_by_area = sorted(
+            keep_labels,
+            key=lambda lbl: int((crop_clipped == lbl).sum()),
+        )
+        crop_final = np.zeros_like(crop_clipped)
+        for lbl in sorted_by_area:  # smaller areas overwrite larger (claim first)
+            crop_final[crop_clipped == lbl] = lbl
+
+        # ── Paste into full-size output with globally unique IDs ──────────────
+        for lbl in keep_labels:
+            region = crop_final == lbl
+            if not region.any():
+                continue
+            # Subtract these pixels from any existing parasite in para_labels
+            existing = para_labels[y0:y1, x0:x1]
+            existing[region] = 0
+
+            para_labels[y0:y1, x0:x1][region] = next_id
+            vacuole_map[next_id] = vac_id
+            next_id += 1
+
+    log(
+        f"Stage 2 complete: {next_id - 1} parasites found "
+        f"across {len(vac_ids)} vacuoles."
+    )
+    return para_labels, vacuole_map

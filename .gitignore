@@ -23,7 +23,18 @@ env/
 # napari-peredox — user data (never commit annotations or trained models)
 annotations/curated_features.csv
 annotations/curated_features.joblib
+annotations/curated_host_features.csv
+annotations/curated_host_features.joblib
 annotations/results/
+annotations/stardist_model/
+annotations/training_data/
+
+# Training run logs
+*.log
+train_log.txt
+train_err.txt
+training_log.txt
+training_err.txt
 
 # Windows launcher (hardcodes user-specific paths)
 launch_napari.bat

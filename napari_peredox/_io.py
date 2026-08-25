@@ -227,3 +227,190 @@ def load_labels(
     if path.exists():
         return tifffile.imread(str(path)).astype(np.int32)
     return None
+
+
+# ── StarDist training data collection ─────────────────────────────────────────
+
+
+def _build_vacuole_mask(
+    labels: np.ndarray,
+    vacuole_map: dict[int, int],
+    decisions: dict[int, int],
+) -> np.ndarray:
+    """
+    Build a per-vacuole label image for the vacuole StarDist model.
+
+    For each vacuole, the union of accepted parasite pixels is dilated (4 px)
+    to bridge internal gaps and hole-filled to produce a compact single region.
+    """
+    from collections import defaultdict
+
+    from scipy.ndimage import binary_fill_holes
+    from skimage.morphology import dilation, disk
+
+    rejected = {lid for lid, dec in decisions.items() if dec == 0}
+
+    vac_parasites: dict[int, list[int]] = defaultdict(list)
+    for para_label, vac_id in vacuole_map.items():
+        if para_label not in rejected:
+            vac_parasites[vac_id].append(para_label)
+
+    vac_mask = np.zeros_like(labels, dtype=np.int32)
+    selem = disk(4)
+    for vac_id, para_labels in vac_parasites.items():
+        union = np.zeros(labels.shape, dtype=bool)
+        for pl in para_labels:
+            union |= labels == pl
+        if not union.any():
+            continue
+        dilated = dilation(union, selem)
+        filled = binary_fill_holes(dilated)
+        vac_mask[filled] = vac_id
+
+    return vac_mask
+
+
+def _build_parasite_mask(
+    labels: np.ndarray,
+    decisions: dict[int, int],
+) -> np.ndarray:
+    """
+    Build a per-parasite label image for the parasite StarDist model.
+
+    Keeps all individual parasite labels except explicitly rejected ones.
+    """
+    rejected = {lid for lid, dec in decisions.items() if dec == 0}
+    if not rejected:
+        return labels.copy()
+    curated = labels.copy()
+    for lid in rejected:
+        curated[labels == lid] = 0
+    return curated
+
+
+def _write_tiff_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    stem: str,
+    base_dir: Path,
+) -> tuple[Path, Path]:
+    """Write (C,H,W) image + int32 mask TIFFs into base_dir/images/ and masks/."""
+    import tifffile
+
+    img_dir = base_dir / "images"
+    mask_dir = base_dir / "masks"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    mask_dir.mkdir(parents=True, exist_ok=True)
+
+    if image.ndim == 2:
+        img_chw = image[np.newaxis].astype(np.float32)
+    else:
+        img_chw = np.moveaxis(image, -1, 0).astype(np.float32)
+
+    img_path = img_dir / f"{stem}.tif"
+    mask_path = mask_dir / f"{stem}_mask.tif"
+    tifffile.imwrite(str(img_path), img_chw, imagej=True)
+    tifffile.imwrite(str(mask_path), mask.astype(np.int32))
+    return img_path, mask_path
+
+
+def save_training_pair(
+    image: np.ndarray,
+    labels: np.ndarray,
+    decisions: dict[int, int],
+    stem: str,
+    training_dir: str | Path,
+    vacuole_map: dict[int, int] | None = None,
+) -> dict[str, tuple[Path, Path]]:
+    """
+    Save (image, mask) TIFF pairs for both StarDist models simultaneously.
+
+    Two pairs are written per curation session:
+
+    * ``vacuoles`` — one filled region per PV (requires vacuole_map).
+      If vacuole_map is None only the parasite pair is written.
+    * ``parasites`` — one label per individual parasite body (rejected labels
+      zeroed out).
+
+    Parameters
+    ----------
+    image : np.ndarray (H, W, C) float32
+    labels : np.ndarray (H, W) int32
+        Per-parasite label array from segmentation / curation.
+    decisions : dict {label_id → 0/1/-1}
+    stem : str
+        Unique name for this image.
+    training_dir : str or Path
+        Root training-data folder.  Sub-folders vacuoles/ and parasites/ are
+        created automatically inside it.
+    vacuole_map : dict {parasite_label → vacuole_id}, optional
+        Required for the vacuole mask.  When absent only the parasite pair
+        is saved.
+
+    Returns
+    -------
+    dict with keys 'vacuoles' and/or 'parasites', each mapping to
+    (img_path, mask_path).
+    """
+    training_dir = Path(training_dir)
+    result: dict[str, tuple[Path, Path]] = {}
+
+    # ── Vacuole training pair ────────────────────────────────────────────────
+    if vacuole_map:
+        vac_mask = _build_vacuole_mask(labels, vacuole_map, decisions)
+        paths = _write_tiff_pair(image, vac_mask, stem, training_dir / "vacuoles")
+        result["vacuoles"] = paths
+
+    # ── Parasite training pair ───────────────────────────────────────────────
+    para_mask = _build_parasite_mask(labels, decisions)
+    paths = _write_tiff_pair(image, para_mask, stem, training_dir / "parasites")
+    result["parasites"] = paths
+
+    return result
+
+
+def clear_training_data(
+    annotations_dir: str | Path,
+    mode: str = "both",
+    clear_model: bool = False,
+) -> int:
+    """
+    Delete StarDist training TIFF pairs and optionally the trained model(s).
+
+    Parameters
+    ----------
+    annotations_dir : str or Path
+    mode : 'vacuoles' | 'parasites' | 'both'
+        Which training dataset to clear.
+    clear_model : bool
+        If True, also remove the stardist_model/ subdirectory for the
+        selected mode(s).
+
+    Returns
+    -------
+    n_deleted : int
+        Total number of TIFF files deleted.
+    """
+    import shutil
+
+    annotations_dir = Path(annotations_dir)
+    training_dir = annotations_dir / "training_data"
+    model_dir = annotations_dir / "stardist_model"
+
+    modes = ["vacuoles", "parasites"] if mode == "both" else [mode]
+    n_deleted = 0
+
+    for m in modes:
+        base = training_dir / m
+        for sub in ("images", "masks"):
+            sub_dir = base / sub
+            if sub_dir.exists():
+                for f in sub_dir.glob("*.tif"):
+                    f.unlink()
+                    n_deleted += 1
+        if clear_model:
+            m_model = model_dir / m
+            if m_model.exists():
+                shutil.rmtree(m_model)
+
+    return n_deleted

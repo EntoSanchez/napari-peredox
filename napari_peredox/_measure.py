@@ -172,16 +172,24 @@ def measure_pvs(
                 row[f"skewness_{ch_name}"] = np.nan
                 row[f"kurtosis_{ch_name}"] = np.nan
 
-        # ── Step 5: compute the Peredox ratio ────────────────────────────────
+        # ── Step 5: compute the Peredox ratio three ways ─────────────────────
         intden_cptsa = row[f"intden_{cptsa_name}"]
         intden_mcherry = row[f"intden_{mcherry_name}"]
+        mean_cptsa = row[f"mean_{cptsa_name}"]
+        mean_mcherry = row[f"mean_{mcherry_name}"]
+        median_cptsa = row[f"median_{cptsa_name}"]
+        median_mcherry = row[f"median_{mcherry_name}"]
 
-        if intden_mcherry != 0:
-            # Normal case: divide cpTSapphire signal by mCherry reference
-            row["ratio_cptsa_mcherry"] = intden_cptsa / intden_mcherry
-        else:
-            # Avoid division by zero (mCherry channel is dark in this region)
-            row["ratio_cptsa_mcherry"] = np.nan
+        row["ratio_intden"] = (
+            intden_cptsa / intden_mcherry if intden_mcherry != 0 else np.nan
+        )
+        row["ratio_mean"] = mean_cptsa / mean_mcherry if mean_mcherry != 0 else np.nan
+        row["ratio_median"] = (
+            median_cptsa / median_mcherry if median_mcherry != 0 else np.nan
+        )
+        # Keep old column name as alias for the intden ratio so existing code
+        # that references ratio_cptsa_mcherry still works.
+        row["ratio_cptsa_mcherry"] = row["ratio_intden"]
 
         rows.append(row)
 
@@ -218,6 +226,7 @@ def select_one_per_vacuole(
         - ``'largest'``       — parasite with the greatest area_px
         - ``'highest_ratio'`` — parasite with the highest cpTSapphire/mCherry ratio
         - ``'median_ratio'``  — parasite closest to the median ratio in the group
+        - ``'mean_ratio'``    — parasite closest to the mean ratio in the group
 
     Returns
     -------
@@ -237,34 +246,103 @@ def select_one_per_vacuole(
     chosen_labels = []  # track label IDs so we can restore the named index
     for _vac_id, group in tagged.groupby("vacuole_id"):
         if method == "largest":
-            # Parasite with the most pixels — most signal, least noise
             chosen_label = group["area_px"].idxmax()
         elif method == "highest_ratio":
-            # Parasite with the highest cpTSapphire/mCherry ratio
             chosen_label = group["ratio_cptsa_mcherry"].idxmax()
         elif method == "median_ratio":
-            # Parasite closest to the median ratio — avoids outliers
-            median_val = group["ratio_cptsa_mcherry"].median()
-            chosen_label = (group["ratio_cptsa_mcherry"] - median_val).abs().idxmin()
+            ref = group["ratio_cptsa_mcherry"].median()
+            chosen_label = (group["ratio_cptsa_mcherry"] - ref).abs().idxmin()
+        elif method == "mean_ratio":
+            ref = group["ratio_cptsa_mcherry"].mean()
+            chosen_label = (group["ratio_cptsa_mcherry"] - ref).abs().idxmin()
         else:
             raise ValueError(
                 f"Unknown method {method!r}. "
-                "Choose 'largest', 'highest_ratio', or 'median_ratio'."
+                "Choose 'largest', 'highest_ratio', 'median_ratio', or 'mean_ratio'."
             )
         row = group.loc[chosen_label].copy()
-        # Vacuole-level summary stats for the selected representative row
         row["parasites_per_vacuole"] = len(group)
         row["vacuole_area_px"] = float(group["area_px"].sum())
+        # Per-vacuole ratio aggregates from individual parasite measurements
+        if "ratio_cptsa_mcherry" in group.columns:
+            row["mean_parasite_ratio"] = float(group["ratio_cptsa_mcherry"].mean())
+            row["median_parasite_ratio"] = float(group["ratio_cptsa_mcherry"].median())
         selected_rows.append(row)
         chosen_labels.append(chosen_label)
 
     result = pd.DataFrame(selected_rows)
-    # pd.DataFrame(list_of_Series) drops the original index and assigns 0,1,2…
-    # Restore the label IDs so downstream code (reset_index → parasite_label)
-    # and the curation widget (measurements.index) see the correct label values.
     result.index = chosen_labels
     result.index.name = "label"
     return result
+
+
+def _snap_pow2(ratio: float) -> int:
+    """Round a continuous parasite-count estimate to the nearest power of 2 (≥ 1)."""
+    if ratio <= 0:
+        return 1
+    return max(1, 2 ** int(round(np.log2(max(ratio, 1.0)))))
+
+
+def add_estimated_parasites(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add ``estimated_parasites_pow2`` column to a per-vacuole measurements table.
+
+    Uses the median vacuole_area_px of singletons (parasites_per_vacuole == 1)
+    as the reference area for one parasite, then snaps each PV's area ratio to
+    the nearest power of 2 (1, 2, 4, 8, 16 …).
+
+    No-ops if the required columns are absent or there are no singletons.
+    """
+    if "vacuole_area_px" not in df.columns or "parasites_per_vacuole" not in df.columns:
+        return df
+    singles = df.loc[df["parasites_per_vacuole"] == 1, "vacuole_area_px"]
+    if singles.empty:
+        return df
+    area_per_parasite = float(singles.median())
+    out = df.copy()
+    out["estimated_parasites_pow2"] = (
+        out["vacuole_area_px"]
+        .apply(lambda a: _snap_pow2(float(a) / area_per_parasite))
+        .astype(int)
+    )
+    return out
+
+
+def measure_vacuoles(
+    labels: np.ndarray,
+    image: np.ndarray,
+    vacuole_map: dict[int, int],
+    ch_cptsa: int,
+    ch_mcherry: int,
+    ch_names: dict[int, str] | None = None,
+    pixel_size_um: float | None = None,
+) -> pd.DataFrame:
+    """
+    Measure fluorescence for entire vacuoles (union of all parasite pixels).
+
+    Remaps the per-parasite label image to per-vacuole labels and runs the
+    same regionprops pipeline as measure_pvs().  Returns a DataFrame indexed
+    by vacuole_id with the same column set as measure_pvs().
+
+    Parameters
+    ----------
+    labels : np.ndarray (H, W)
+        Per-parasite label image (0 = background).
+    image : np.ndarray (H, W, C)
+        Multi-channel image.
+    vacuole_map : dict {parasite_label → vacuole_id}
+        From _segment.group_by_vacuole().
+    ch_cptsa, ch_mcherry, ch_names, pixel_size_um
+        Same meaning as in measure_pvs().
+
+    Returns
+    -------
+    pd.DataFrame indexed by vacuole_id.
+    """
+    vac_labels = np.zeros_like(labels)
+    for para_label, vac_id in vacuole_map.items():
+        vac_labels[labels == para_label] = vac_id
+    return measure_pvs(vac_labels, image, ch_cptsa, ch_mcherry, ch_names, pixel_size_um)
 
 
 def summary_stats(df: pd.DataFrame) -> pd.DataFrame:

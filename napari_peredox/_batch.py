@@ -63,8 +63,9 @@ from qtpy.QtWidgets import (
     QListWidget,
     QProgressBar,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -400,26 +401,37 @@ class _BatchWorker(QObject):
             treatment: str = p["treatment"]
             cell_line: str = p["cell_line"]
             replicate: int = p["replicate"]
-            ch_cptsa: int = p["ch_cptsa"]
-            ch_mcherry: int = p["ch_mcherry"]
-            seg_ch: int = p["seg_ch"]
+            vac_seg_ch: int = p.get("vac_seg_ch", 1)  # Stage 1 — whole vacuole
             use_composite: bool = p["use_composite"]
-            min_area_um2: float = p["min_area_um2"]
-            max_area_um2: float = p["max_area_um2"]
+            vac_min_area_um2: float = p.get("vac_min_area_um2", 20.0)
+            vac_max_area_um2: float = p.get("vac_max_area_um2", 2000.0)
             max_eccentricity: float = p.get("max_eccentricity", 0.85)
             min_solidity: float = p.get("min_solidity", 0.70)
             pixel_size: float = p["pixel_size"]
-            classifier = p["classifier"]
             out_folder: Path = p["out_folder"]
             diameter = p.get("diameter")
             flow_threshold: float = p.get("flow_threshold", 0.4)
             cellprob_threshold: float = p.get("cellprob_threshold", 0.0)
 
-            ch_names = {ch_cptsa: "cptsa", ch_mcherry: "mcherry"}
+            seg_backend: int = p.get("seg_backend", 0)  # 0=cpSAM, 1=StarDist
+            annot_dir: str = p.get("annot_dir", "")
 
-            from ._learning import extract_features
-            from ._measure import measure_pvs, select_one_per_vacuole
-            from ._segment import apply_classifier_filter, group_by_vacuole, segment_pvs
+            # Pre-load StarDist vacuole model once before the position loop
+            sd_vac_model = None
+            if seg_backend == 1:
+                from pathlib import Path as _Path
+
+                from ._stardist import load_stardist_model
+
+                sd_model_dir = _Path(annot_dir) / "stardist_model"
+                sd_vac_model = load_stardist_model(sd_model_dir, mode="vacuoles")
+                if sd_vac_model is None:
+                    self.error.emit(
+                        f"StarDist vacuole model not found in {sd_model_dir}. "
+                        "Train the vacuole model first using the StarDist panel."
+                    )
+                    return
+                self.progress.emit(0, 1, "StarDist vacuole model loaded.")
 
             # Create output subdirectories
             mip_dir = out_folder / "mips"
@@ -427,7 +439,6 @@ class _BatchWorker(QObject):
             mip_dir.mkdir(parents=True, exist_ok=True)
             mask_dir.mkdir(parents=True, exist_ok=True)
 
-            all_rows: list[pd.DataFrame] = []
             curation_list: list[dict] = []  # per-position data for curation gallery
 
             # ── Build the list of (file_stem, pos_name, image, px_um) ─────────
@@ -520,177 +531,121 @@ class _BatchWorker(QObject):
                             f"    WARNING: could not save MIP: {exc}",
                         )
 
-                # ── Segment parasites ─────────────────────────────────────────
-                # Convert µm² area limits to pixel² using per-file pixel size.
-                # If pixel size is unknown, disable the area filter and warn.
+                # ── Stage 1: detect whole vacuoles ───────────────────────────
                 if file_px > 0:
-                    min_area_px = min_area_um2 / (file_px**2)
-                    max_area_px = max_area_um2 / (file_px**2)
+                    vac_min_area_px = vac_min_area_um2 / (file_px**2)
+                    vac_max_area_px = vac_max_area_um2 / (file_px**2)
                     self.progress.emit(
                         pos_idx,
                         total,
-                        f"    Area filter: {min_area_um2}–{max_area_um2} µm² "
-                        f"= {min_area_px:.0f}–{max_area_px:.0f} px² "
-                        f"(pixel size {file_px} µm/px)",
+                        f"    Vacuole area filter: {vac_min_area_um2}–{vac_max_area_um2} µm² "
+                        f"= {vac_min_area_px:.0f}–{vac_max_area_px:.0f} px²",
                     )
                 else:
-                    min_area_px = 0.0
-                    max_area_px = 1e9
-                    self.progress.emit(
-                        pos_idx,
-                        total,
-                        "    WARNING: pixel size unknown — area filter DISABLED. "
-                        "Set pixel size in the UI to enforce µm² limits.",
-                    )
+                    vac_min_area_px = 0.0
+                    vac_max_area_px = 1e9
 
                 try:
-                    labels, _, fstats = segment_pvs(
-                        image=image,
-                        channel_index=seg_ch,
-                        use_composite=use_composite,
-                        min_area_px=min_area_px,
-                        max_area_px=max_area_px,
-                        max_eccentricity=max_eccentricity,
-                        min_solidity=min_solidity,
-                        diameter=diameter,
-                        flow_threshold=flow_threshold,
-                        cellprob_threshold=cellprob_threshold,
-                        threshold_method=p.get("threshold_method", "none"),
-                        threshold_channel=p.get("threshold_channel", seg_ch),
-                        threshold_value=p.get("threshold_value", 0.0),
-                        threshold_percentile=p.get("threshold_percentile", 50.0),
-                        watershed_split=p.get("watershed_split", False),
-                        watershed_min_distance=p.get("watershed_min_distance", 10),
-                    )
-                    if fstats.get("threshold_skipped"):
+                    if seg_backend == 1:
+                        from ._segment import filter_labels
+                        from ._stardist import predict_stardist
+
+                        raw_sd = predict_stardist(image, sd_vac_model, vac_seg_ch)
+                        vac_labels, _, fstats = filter_labels(
+                            raw_sd,
+                            vac_min_area_px,
+                            vac_max_area_px,
+                            max_eccentricity,
+                            min_solidity,
+                        )
                         self.progress.emit(
                             pos_idx,
                             total,
-                            f"    WARNING: {fstats['threshold_method']} threshold "
-                            f"(cutoff={fstats['threshold_cutoff']:.1f}) would remove "
-                            f"{100 - fstats['pct_kept']:.1f}% of pixels — skipped.",
+                            f"    StarDist vacuoles: {fstats['total_raw']} raw → "
+                            f"{fstats['kept']} kept "
+                            f"(area:{fstats['rejected_area']} "
+                            f"ecc:{fstats['rejected_eccentricity']} "
+                            f"sol:{fstats['rejected_solidity']} rejected)",
                         )
-                    elif fstats["threshold_method"] != "none":
+                    else:
+                        from ._segment import segment_pvs
+
+                        vac_labels, _, fstats = segment_pvs(
+                            image=image,
+                            channel_index=vac_seg_ch,
+                            use_composite=use_composite,
+                            min_area_px=vac_min_area_px,
+                            max_area_px=vac_max_area_px,
+                            max_eccentricity=max_eccentricity,
+                            min_solidity=min_solidity,
+                            diameter=diameter,
+                            flow_threshold=flow_threshold,
+                            cellprob_threshold=cellprob_threshold,
+                            threshold_method=p.get("threshold_method", "none"),
+                            threshold_channel=p.get("threshold_channel", vac_seg_ch),
+                            threshold_value=p.get("threshold_value", 0.0),
+                            threshold_percentile=p.get("threshold_percentile", 50.0),
+                            watershed_split=False,  # don't split vacuole masks
+                        )
+                        if fstats.get("threshold_skipped"):
+                            self.progress.emit(
+                                pos_idx,
+                                total,
+                                f"    WARNING: threshold would remove "
+                                f"{100 - fstats['pct_kept']:.1f}% of pixels — skipped.",
+                            )
                         self.progress.emit(
                             pos_idx,
                             total,
-                            f"    Threshold ({fstats['threshold_method']}, "
-                            f"cutoff={fstats['threshold_cutoff']:.1f}): "
-                            f"{fstats['pct_kept']:.1f}% pixels kept.",
+                            f"    cpSAM vacuoles: {fstats['total_raw']} raw → "
+                            f"{fstats['kept']} kept "
+                            f"(area:{fstats['rejected_area']} "
+                            f"ecc:{fstats['rejected_eccentricity']} "
+                            f"sol:{fstats['rejected_solidity']} rejected)",
                         )
-                    self.progress.emit(
-                        pos_idx,
-                        total,
-                        f"    Cellpose: {fstats['total_raw']} raw → "
-                        f"{fstats['kept']} kept "
-                        f"(area:{fstats['rejected_area']} "
-                        f"ecc:{fstats['rejected_eccentricity']} "
-                        f"sol:{fstats['rejected_solidity']} rejected)",
-                    )
                 except Exception as exc:
                     self.progress.emit(
-                        pos_idx, total, f"    Segmentation failed: {exc}"
+                        pos_idx, total, f"    Stage 1 segmentation failed: {exc}"
                     )
                     continue
 
-                # ── Classifier filter ─────────────────────────────────────────
-                if classifier is not None and labels.max() > 0:
-                    features = extract_features(
-                        labels=labels,
-                        image=image,
-                        seg_channel=seg_ch,
-                        ch_cptsa=ch_cptsa,
-                        ch_mcherry=ch_mcherry,
-                        ch_names=ch_names,
-                    )
-                    if len(features) > 0:
-                        labels = apply_classifier_filter(labels, features, classifier)
-
-                n_parasites = int(labels.max())
+                n_vacuoles = int(vac_labels.max())
                 self.progress.emit(
-                    pos_idx,
-                    total,
-                    f"    {n_parasites} parasites detected — measuring…",
+                    pos_idx, total, f"    {n_vacuoles} vacuoles detected."
                 )
 
-                # ── Save mask TIFF ────────────────────────────────────────────
-                mask_path = mask_dir / f"{file_stem}_{safe_pos}_mask.tif"
+                # ── Save vacuole mask TIFF ────────────────────────────────────
+                mask_path = mask_dir / f"{file_stem}_{safe_pos}_vac_mask.tif"
                 try:
-                    save_mask_tiff(labels, mask_path)
+                    save_mask_tiff(vac_labels, mask_path)
                     self.progress.emit(
-                        pos_idx,
-                        total,
-                        f"    Mask saved → masks/{mask_path.name}",
+                        pos_idx, total, f"    Vac mask → masks/{mask_path.name}"
                     )
                 except Exception as exc:
                     self.progress.emit(
-                        pos_idx,
-                        total,
-                        f"    WARNING: could not save mask: {exc}",
-                    )
-
-                if n_parasites == 0:
-                    continue
-
-                # ── Measure fluorescence ──────────────────────────────────────
-                try:
-                    meas = measure_pvs(
-                        labels=labels,
-                        image=image,
-                        ch_cptsa=ch_cptsa,
-                        ch_mcherry=ch_mcherry,
-                        ch_names=ch_names,
-                        pixel_size_um=file_px if file_px > 0 else None,
-                    )
-                except Exception as exc:
-                    self.progress.emit(pos_idx, total, f"    Measurement failed: {exc}")
-                    continue
-
-                # ── Group by vacuole, select one parasite each ────────────────
-                vac_map: dict[int, int] = {}
-                if p.get("group_vacuoles", True) and not meas.empty:
-                    vac_map = group_by_vacuole(
-                        labels, dilation_px=p.get("dilation_px", 5)
-                    )
-                    meas = select_one_per_vacuole(
-                        meas, vac_map, method=p.get("vacuole_method", "largest")
+                        pos_idx, total, f"    WARNING: could not save vac mask: {exc}"
                     )
 
                 # ── Store for curation gallery ────────────────────────────────
+                # Parasite detection (Stage 2) runs interactively during curation.
                 curation_list.append(
                     {
                         "display_name": f"{file_stem} | {pos_name}",
                         "file": file_stem,
                         "position_name": pos_name,
                         "image": image,
-                        "labels": labels,
-                        "measurements": meas.copy(),
-                        # Full label→vacuole map so CurationWidget can show all
-                        # siblings in a vacuole even when measurements only has
-                        # the representative parasite for each vacuole.
-                        "vac_map": vac_map,
+                        "vac_labels": vac_labels,
+                        "file_px": file_px,
+                        "treatment": treatment,
+                        "cell_line": cell_line,
+                        "replicate": replicate,
+                        "pos_idx": pos_idx,
                     }
                 )
 
-                # ── Prepend metadata columns ──────────────────────────────────
-                meas.insert(0, "position_name", pos_name)
-                meas.insert(0, "position_index", pos_idx)
-                meas.insert(0, "replicate", replicate)
-                meas.insert(0, "cell_line", cell_line)
-                meas.insert(0, "treatment", treatment)
-                meas.insert(0, "file", file_stem)
-                all_rows.append(meas)
-
-            # ── Combine all positions ─────────────────────────────────────────
-            if all_rows:
-                result = pd.concat(all_rows, ignore_index=False)
-                result = result.reset_index().rename(
-                    columns={"label": "parasite_label"}
-                )
-            else:
-                result = pd.DataFrame()
-
-            self.finished.emit(result, curation_list)
+            # Worker emits an empty DataFrame for now — results are built during
+            # interactive curation and saved via _save_accepted_results.
+            self.finished.emit(pd.DataFrame(), curation_list)
 
         except Exception:
             self.error.emit(traceback.format_exc())
@@ -739,28 +694,32 @@ class BatchWidget(QWidget):
 
         self._build_ui()
         self._try_load_classifier()
+        self._update_stardist_status()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Wrap everything in a scroll area so the panel is usable when
-        # the dock widget is too short to show all controls.
+        self.setMinimumWidth(400)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(4)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        outer.addWidget(scroll)
+        tabs = QTabWidget()
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        tabs.addTab(self._build_source_tab(), "Source")
+        tabs.addTab(self._build_channels_tab(), "Channels")
+        tabs.addTab(self._build_output_tab(), "Output")
+        tabs.addTab(self._build_log_tab(), "Log")
+        outer.addWidget(tabs)
 
-        _content = QWidget()
-        scroll.setWidget(_content)
+    # ── Source tab ────────────────────────────────────────────────────────────
 
-        root = QVBoxLayout(_content)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(8)
+    def _build_source_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
 
-        # ---- Source type toggle ---------------------------------------------
         src_box = QGroupBox("Image source")
         src_layout = QVBoxLayout(src_box)
 
@@ -777,13 +736,13 @@ class BatchWidget(QWidget):
         nd2_layout.setContentsMargins(0, 0, 0, 0)
         self._file_list = QListWidget()
         self._file_list.setSelectionMode(QListWidget.ExtendedSelection)
-        self._file_list.setMaximumHeight(100)
+        self._file_list.setMinimumHeight(80)
         nd2_layout.addWidget(self._file_list)
         btn_row = QHBoxLayout()
         for label, slot in [
             ("Add files…", self._add_files),
             ("Add folder…", self._add_folder),
-            ("Remove selected", self._remove_selected),
+            ("Remove", self._remove_selected),
             ("Clear", self._file_list.clear),
         ]:
             b = QPushButton(label)
@@ -804,13 +763,11 @@ class BatchWidget(QWidget):
         tiff_layout.addWidget(tiff_browse)
         src_layout.addWidget(self._tiff_widget)
 
-        root.addWidget(src_box)
-
-        # Show/hide based on source type
         self._tiff_widget.setVisible(False)
         self._src_type.currentIndexChanged.connect(self._on_src_type_changed)
+        layout.addWidget(src_box)
 
-        # ---- Experiment metadata --------------------------------------------
+        # Experiment metadata
         meta_box = QGroupBox("Experiment metadata")
         meta_form = QFormLayout(meta_box)
         meta_form.setContentsMargins(6, 6, 6, 6)
@@ -828,334 +785,353 @@ class BatchWidget(QWidget):
         self._replicate.setValue(1)
         meta_form.addRow("Replicate #:", self._replicate)
 
-        root.addWidget(meta_box)
+        layout.addWidget(meta_box)
+        layout.addStretch()
+        return w
 
-        # ---- Channel configuration ------------------------------------------
-        ch_box = QGroupBox("Channel configuration")
+    # ── Channels tab ─────────────────────────────────────────────────────────
+
+    def _build_channels_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        ch_box = QGroupBox("Channels & segmentation")
         ch_form = QFormLayout(ch_box)
         ch_form.setContentsMargins(6, 6, 6, 6)
 
         self._ch_cptsa = QSpinBox()
         self._ch_cptsa.setRange(0, 15)
         self._ch_cptsa.setValue(0)
-        self._ch_cptsa.setToolTip("Channel index of cpTSapphire (NADH sensor)")
-        ch_form.addRow("cpTSapphire channel:", self._ch_cptsa)
+        ch_form.addRow("cpTSapphire ch:", self._ch_cptsa)
 
         self._ch_mcherry = QSpinBox()
         self._ch_mcherry.setRange(0, 15)
         self._ch_mcherry.setValue(1)
-        self._ch_mcherry.setToolTip("Channel index of mCherry (reference)")
-        ch_form.addRow("mCherry channel:", self._ch_mcherry)
+        ch_form.addRow("mCherry ch:", self._ch_mcherry)
+
+        self._seg_backend = QComboBox()
+        self._seg_backend.addItems(["cpSAM (Cellpose)", "StarDist (fine-tuned)"])
+        ch_form.addRow("Model:", self._seg_backend)
+
+        self._vac_seg_ch = QSpinBox()
+        self._vac_seg_ch.setRange(0, 15)
+        self._vac_seg_ch.setValue(1)
+        self._vac_seg_ch.setToolTip("Channel used for Stage 1 whole-vacuole detection")
+        ch_form.addRow("Vacuole ch:", self._vac_seg_ch)
 
         self._seg_ch = QSpinBox()
         self._seg_ch.setRange(0, 15)
         self._seg_ch.setValue(0)
-        self._seg_ch.setToolTip(
-            "Which channel Cellpose-SAM uses as input for segmentation"
-        )
-        self._use_composite = QCheckBox("Max composite of all channels")
-        self._use_composite.setToolTip(
-            "If checked, Cellpose-SAM receives the per-pixel channel maximum instead of "
-            "a single channel."
-        )
+        self._use_composite = QCheckBox("Max composite")
         seg_row = QHBoxLayout()
         seg_row.addWidget(self._seg_ch)
         seg_row.addWidget(self._use_composite)
-        ch_form.addRow("Segment on channel:", seg_row)
+        ch_form.addRow("Parasite ch:", seg_row)
 
-        # Cellpose diameter
         self._diameter = QSpinBox()
         self._diameter.setRange(0, 2000)
         self._diameter.setValue(0)
         self._diameter.setSpecialValueText("auto")
-        self._diameter.setToolTip(
-            "Expected object diameter in pixels.  0 = auto-estimate.\n"
-            "Increase this if cellpose finds individual parasites\n"
-            "instead of whole vacuoles (try 30–80 for typical PVs)."
-        )
-        ch_form.addRow("Diameter (px, 0=auto):", self._diameter)
+        ch_form.addRow("Diameter (px):", self._diameter)
 
-        # Cellpose thresholds
         self._flow_thresh = QDoubleSpinBox()
         self._flow_thresh.setRange(0.0, 3.0)
         self._flow_thresh.setSingleStep(0.1)
         self._flow_thresh.setDecimals(2)
         self._flow_thresh.setValue(0.4)
-        self._flow_thresh.setToolTip(
-            "Flow error threshold.  Higher = more permissive (more masks).  Default 0.4."
-        )
         self._cellprob_thresh = QDoubleSpinBox()
         self._cellprob_thresh.setRange(-6.0, 6.0)
         self._cellprob_thresh.setSingleStep(0.5)
         self._cellprob_thresh.setDecimals(1)
         self._cellprob_thresh.setValue(0.0)
-        self._cellprob_thresh.setToolTip(
-            "Cell probability threshold.  Lower = more permissive.  Default 0.0."
-        )
         thresh_row = QHBoxLayout()
         thresh_row.addWidget(QLabel("flow:"))
         thresh_row.addWidget(self._flow_thresh)
         thresh_row.addWidget(QLabel("prob:"))
         thresh_row.addWidget(self._cellprob_thresh)
-        ch_form.addRow("Cellpose thresholds:", thresh_row)
+        ch_form.addRow("cpSAM thresholds:", thresh_row)
 
         # Vacuole grouping
-        self._group_vacuoles = QCheckBox("Group parasites into vacuoles")
+        self._group_vacuoles = QCheckBox("Group into vacuoles")
         self._group_vacuoles.setChecked(True)
-        self._group_vacuoles.setToolTip(
-            "Merge nearby parasite masks to identify vacuoles, then select\n"
-            "one representative parasite per vacuole for reporting."
-        )
         self._dilation_px = QSpinBox()
         self._dilation_px.setRange(1, 100)
         self._dilation_px.setValue(5)
-        self._dilation_px.setToolTip(
-            "Dilation radius (px) used when grouping parasites into vacuoles."
-        )
         self._vacuole_method = QComboBox()
-        self._vacuole_method.addItems(["largest", "highest_ratio", "median_ratio"])
-        self._vacuole_method.setToolTip(
-            "Which parasite to use as the representative for each vacuole."
+        self._vacuole_method.addItems(
+            ["largest", "highest_ratio", "median_ratio", "mean_ratio"]
         )
         group_row = QHBoxLayout()
         group_row.addWidget(self._group_vacuoles)
-        group_row.addWidget(QLabel("dilation:"))
+        group_row.addWidget(QLabel("dil:"))
         group_row.addWidget(self._dilation_px)
         ch_form.addRow("Vacuole grouping:", group_row)
-        ch_form.addRow("Select parasite by:", self._vacuole_method)
+        ch_form.addRow("Select by:", self._vacuole_method)
         self._group_vacuoles.toggled.connect(self._dilation_px.setEnabled)
         self._group_vacuoles.toggled.connect(self._vacuole_method.setEnabled)
 
-        # Watershed splitting
-        self._watershed_split = QCheckBox("Split merged segments (watershed)")
+        # Watershed
+        self._watershed_split = QCheckBox("Watershed split")
         self._watershed_split.setChecked(False)
-        self._watershed_split.setToolTip(
-            "If Cellpose segments the whole vacuole as one object, enable this\n"
-            "to split each mask into individual parasites using distance-transform\n"
-            "watershed seeded by intensity peaks."
-        )
         self._watershed_min_dist = QSpinBox()
         self._watershed_min_dist.setRange(2, 200)
         self._watershed_min_dist.setValue(10)
-        self._watershed_min_dist.setToolTip(
-            "Minimum pixel distance between neighbouring parasite centres.\n"
-            "≈ parasite radius in pixels. At 0.105 µm/px (60×), 10 px ≈ 1 µm."
-        )
-        watershed_row = QHBoxLayout()
-        watershed_row.addWidget(self._watershed_split)
-        watershed_row.addWidget(QLabel("min sep:"))
-        watershed_row.addWidget(self._watershed_min_dist)
-        ch_form.addRow("Watershed split:", watershed_row)
+        ws_row = QHBoxLayout()
+        ws_row.addWidget(self._watershed_split)
+        ws_row.addWidget(QLabel("min sep:"))
+        ws_row.addWidget(self._watershed_min_dist)
+        ch_form.addRow("", ws_row)
         self._watershed_split.toggled.connect(self._watershed_min_dist.setEnabled)
         self._watershed_min_dist.setEnabled(False)
 
-        # Pre-segmentation intensity threshold
+        # Intensity threshold
         self._thresh_method = QComboBox()
         self._thresh_method.addItems(["none", "otsu", "percentile", "manual"])
-        self._thresh_method.setToolTip(
-            "Threshold applied before segmentation to mask out autofluorescent regions.\n"
-            "  none        — no masking\n"
-            "  otsu        — automatic Otsu threshold\n"
-            "  percentile  — threshold at Nth percentile of non-zero pixels\n"
-            "  manual      — explicit cutoff value"
-        )
         self._thresh_channel = QSpinBox()
         self._thresh_channel.setRange(0, 15)
-        self._thresh_channel.setValue(0)
-        self._thresh_channel.setToolTip("Channel to compute the threshold on")
         self._thresh_value = QDoubleSpinBox()
         self._thresh_value.setRange(0.0, 1e9)
         self._thresh_value.setDecimals(1)
-        self._thresh_value.setValue(0.0)
-        self._thresh_value.setToolTip("Manual threshold value (raw image units)")
         self._thresh_percentile = QDoubleSpinBox()
         self._thresh_percentile.setRange(0.0, 100.0)
         self._thresh_percentile.setSingleStep(5.0)
         self._thresh_percentile.setDecimals(1)
         self._thresh_percentile.setValue(50.0)
-        self._thresh_percentile.setToolTip(
-            "Percentile of non-zero pixels to threshold at (0–100)"
-        )
-        thresh_method_row = QHBoxLayout()
-        thresh_method_row.addWidget(self._thresh_method)
-        thresh_method_row.addWidget(QLabel("ch:"))
-        thresh_method_row.addWidget(self._thresh_channel)
-        ch_form.addRow("Intensity threshold:", thresh_method_row)
-        thresh_val_row = QHBoxLayout()
-        thresh_val_row.addWidget(QLabel("value:"))
-        thresh_val_row.addWidget(self._thresh_value)
-        thresh_val_row.addWidget(QLabel("pct:"))
-        thresh_val_row.addWidget(self._thresh_percentile)
-        ch_form.addRow("", thresh_val_row)
+        thr1 = QHBoxLayout()
+        thr1.addWidget(self._thresh_method)
+        thr1.addWidget(QLabel("ch:"))
+        thr1.addWidget(self._thresh_channel)
+        ch_form.addRow("Int. threshold:", thr1)
+        thr2 = QHBoxLayout()
+        thr2.addWidget(QLabel("val:"))
+        thr2.addWidget(self._thresh_value)
+        thr2.addWidget(QLabel("pct:"))
+        thr2.addWidget(self._thresh_percentile)
+        ch_form.addRow("", thr2)
 
-        def _update_thresh_controls(method: str):
+        def _upd_thresh(method: str) -> None:
             self._thresh_value.setEnabled(method == "manual")
             self._thresh_percentile.setEnabled(method == "percentile")
             self._thresh_channel.setEnabled(method != "none")
 
-        self._thresh_method.currentTextChanged.connect(_update_thresh_controls)
-        _update_thresh_controls("none")
+        self._thresh_method.currentTextChanged.connect(_upd_thresh)
+        _upd_thresh("none")
+
+        self._cpsam_only_widgets = [
+            self._use_composite,
+            self._diameter,
+            self._flow_thresh,
+            self._cellprob_thresh,
+            self._watershed_split,
+            self._watershed_min_dist,
+            self._thresh_method,
+            self._thresh_channel,
+            self._thresh_value,
+            self._thresh_percentile,
+        ]
+
+        def _on_backend_changed(_idx: int) -> None:
+            is_cpsam = self._seg_backend.currentIndex() == 0
+            for ww in self._cpsam_only_widgets:
+                ww.setEnabled(is_cpsam)
+
+        self._seg_backend.currentIndexChanged.connect(_on_backend_changed)
+        layout.addWidget(ch_box)
+
+        # Morphology filters
+        filt_box = QGroupBox("Morphology filters")
+        filt_form = QFormLayout(filt_box)
+        filt_form.setContentsMargins(6, 6, 6, 6)
+
+        self._vac_min_area_um2 = QDoubleSpinBox()
+        self._vac_min_area_um2.setRange(0.0, 1_000_000.0)
+        self._vac_min_area_um2.setDecimals(1)
+        self._vac_min_area_um2.setValue(20.0)
+        self._vac_max_area_um2 = QDoubleSpinBox()
+        self._vac_max_area_um2.setRange(0.0, 1_000_000.0)
+        self._vac_max_area_um2.setDecimals(1)
+        self._vac_max_area_um2.setValue(2000.0)
+        vac_area_row = QHBoxLayout()
+        vac_area_row.addWidget(QLabel("min:"))
+        vac_area_row.addWidget(self._vac_min_area_um2)
+        vac_area_row.addWidget(QLabel("max:"))
+        vac_area_row.addWidget(self._vac_max_area_um2)
+        filt_form.addRow("Vacuole area (µm²):", vac_area_row)
 
         self._min_area_um2 = QDoubleSpinBox()
         self._min_area_um2.setRange(0.0, 100_000.0)
         self._min_area_um2.setDecimals(1)
         self._min_area_um2.setValue(5.0)
-        self._min_area_um2.setToolTip(
-            "Minimum parasite area in µm². Smaller objects are discarded.\n"
-            "Typical parasites at 60× with 0.105 µm/px: 5–25 µm².\n"
-            "Converted to pixels using the pixel size below. Set to 0 to disable."
-        )
         self._max_area_um2 = QDoubleSpinBox()
         self._max_area_um2.setRange(0.0, 100_000.0)
         self._max_area_um2.setDecimals(1)
         self._max_area_um2.setValue(25.0)
-        self._max_area_um2.setToolTip(
-            "Maximum parasite area in µm². Larger objects are discarded.\n"
-            "Typical parasites at 60× with 0.105 µm/px: 5–25 µm².\n"
-            "Converted to pixels using the pixel size below. Set to 100000 to disable."
-        )
         area_row = QHBoxLayout()
         area_row.addWidget(QLabel("min:"))
         area_row.addWidget(self._min_area_um2)
         area_row.addWidget(QLabel("max:"))
         area_row.addWidget(self._max_area_um2)
-        ch_form.addRow("Area filter (µm²):", area_row)
+        filt_form.addRow("Parasite area (µm²):", area_row)
 
         self._max_eccentricity = QDoubleSpinBox()
         self._max_eccentricity.setRange(0.0, 1.0)
         self._max_eccentricity.setSingleStep(0.05)
         self._max_eccentricity.setDecimals(2)
         self._max_eccentricity.setValue(0.95)
-        self._max_eccentricity.setToolTip(
-            "Reject segments more elongated than this.\n"
-            "0 = perfect circle, 1 = line. Parasites are typically < 0.85.\n"
-            "Set to 1.0 to disable this filter."
-        )
         self._min_solidity = QDoubleSpinBox()
         self._min_solidity.setRange(0.0, 1.0)
         self._min_solidity.setSingleStep(0.05)
         self._min_solidity.setDecimals(2)
         self._min_solidity.setValue(0.60)
-        self._min_solidity.setToolTip(
-            "Reject segments less solid than this (area / convex hull area).\n"
-            "Parasites are compact (> 0.7); debris is often fragmented or irregular.\n"
-            "Set to 0.0 to disable this filter."
-        )
         shape_row = QHBoxLayout()
         shape_row.addWidget(QLabel("max ecc:"))
         shape_row.addWidget(self._max_eccentricity)
         shape_row.addWidget(QLabel("min sol:"))
         shape_row.addWidget(self._min_solidity)
-        ch_form.addRow("Shape filter:", shape_row)
+        filt_form.addRow("Shape:", shape_row)
+
+        layout.addWidget(filt_box)
+        layout.addStretch()
+        return w
+
+    # ── Output tab ────────────────────────────────────────────────────────────
+
+    def _build_output_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        # Pixel size + dirs
+        out_box = QGroupBox("Output settings")
+        out_form = QFormLayout(out_box)
+        out_form.setContentsMargins(6, 6, 6, 6)
 
         self._pixel_size = QDoubleSpinBox()
         self._pixel_size.setRange(0, 100)
         self._pixel_size.setDecimals(4)
         self._pixel_size.setValue(0.0)
         self._pixel_size.setToolTip(
-            "Physical pixel size in µm (used for area_um2 column). "
-            "Leave at 0 to skip area calibration."
+            "Physical pixel size in µm. Leave at 0 to auto-detect from file metadata."
         )
-        ch_form.addRow("Pixel size (µm):", self._pixel_size)
+        out_form.addRow("Pixel size (µm):", self._pixel_size)
 
-        root.addWidget(ch_box)
-
-        # ---- Output folder --------------------------------------------------
-        out_box = QGroupBox("Output")
-        out_layout = QFormLayout(out_box)
-        out_layout.setContentsMargins(6, 6, 6, 6)
-
-        # Output folder — MIPs go in a mips/ subdirectory, CSV saved at root
         self._out_folder = QLineEdit()
         self._out_folder.setPlaceholderText("Select output folder…")
         browse_out = QPushButton("…")
-        browse_out.setFixedWidth(28)
+        browse_out.setFixedWidth(26)
         browse_out.clicked.connect(self._browse_output_folder)
         out_row = QHBoxLayout()
         out_row.addWidget(self._out_folder, stretch=1)
         out_row.addWidget(browse_out)
-        out_layout.addRow("Output folder:", out_row)
+        out_form.addRow("Output folder:", out_row)
 
-        # Annotations dir — used to load the trained PV classifier
         self._annot_dir = QLineEdit()
         self._annot_dir.setText(str(Path(__file__).parent.parent / "annotations"))
         browse_annot = QPushButton("…")
-        browse_annot.setFixedWidth(28)
+        browse_annot.setFixedWidth(26)
         browse_annot.clicked.connect(self._browse_annot_dir)
         annot_row = QHBoxLayout()
         annot_row.addWidget(self._annot_dir, stretch=1)
         annot_row.addWidget(browse_annot)
-        out_layout.addRow("Annotations dir:", annot_row)
+        out_form.addRow("Annotations dir:", annot_row)
 
-        root.addWidget(out_box)
+        layout.addWidget(out_box)
 
-        # ---- Classifier status ----------------------------------------------
+        # Classifier
+        clf_box = QGroupBox("Classifier")
+        clf_layout = QVBoxLayout(clf_box)
         self._use_classifier = QCheckBox("Apply classifier filter")
         self._use_classifier.setChecked(False)
-        self._use_classifier.setToolTip(
-            "When checked, a trained RandomForest classifier automatically removes\n"
-            "false-positive segments before measurements are computed.\n"
-            "Uncheck until you have enough curated data for a reliable model."
-        )
-        root.addWidget(self._use_classifier)
+        clf_layout.addWidget(self._use_classifier)
         self._clf_label = QLabel("Classifier: not loaded")
         self._clf_label.setWordWrap(True)
-        root.addWidget(self._clf_label)
+        clf_layout.addWidget(self._clf_label)
+        layout.addWidget(clf_box)
 
-        # ---- Run + progress -------------------------------------------------
+        # Run button + progress
+        run_box = QGroupBox("Run")
+        run_layout = QVBoxLayout(run_box)
         self._btn_run = QPushButton("▶ Run batch")
         self._btn_run.setStyleSheet("font-weight: bold;")
         self._btn_run.clicked.connect(self._run)
-        root.addWidget(self._btn_run)
-
+        run_layout.addWidget(self._btn_run)
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
-        root.addWidget(self._progress_bar)
+        run_layout.addWidget(self._progress_bar)
+        layout.addWidget(run_box)
 
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setMaximumHeight(150)
-        root.addWidget(self._log)
-
-        # ---- Manual review + save -------------------------------------------
-        review_box = QGroupBox("Manual review")
+        # Review + save
+        review_box = QGroupBox("Review & save")
         review_layout = QVBoxLayout(review_box)
-        review_layout.setContentsMargins(6, 6, 6, 6)
-
-        review_info = QLabel(
-            "After running, review each position in the curation gallery\n"
-            "to accept/reject individual segments. Then save accepted results."
-        )
-        review_info.setWordWrap(True)
-        review_layout.addWidget(review_info)
-
         self._review_status = QLabel("No batch run yet.")
         self._review_status.setWordWrap(True)
         review_layout.addWidget(self._review_status)
 
         self._curation_combo = QComboBox()
+        self._curation_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._curation_combo.setEnabled(False)
         review_layout.addWidget(self._curation_combo)
 
-        self._btn_curate = QPushButton("Open selected position in curation gallery")
+        self._btn_curate = QPushButton("Open in curation gallery")
         self._btn_curate.setEnabled(False)
         self._btn_curate.clicked.connect(self._open_curation)
         review_layout.addWidget(self._btn_curate)
 
-        self._btn_save_results = QPushButton("Save accepted results CSV")
+        self._btn_save_results = QPushButton("💾 Save accepted results CSV")
         self._btn_save_results.setStyleSheet("font-weight: bold;")
         self._btn_save_results.setEnabled(False)
-        self._btn_save_results.setToolTip(
-            "Saves results.csv to the output folder.\n"
-            "Parasites you explicitly rejected in the curation gallery are excluded.\n"
-            "Positions not yet reviewed keep all detected parasites."
-        )
         self._btn_save_results.clicked.connect(self._save_accepted_results)
         review_layout.addWidget(self._btn_save_results)
 
-        root.addWidget(review_box)
+        layout.addWidget(review_box)
+        layout.addStretch()
+        return w
 
-        root.addStretch()
+    # ── Log tab ───────────────────────────────────────────────────────────────
+
+    def _build_log_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        # StarDist training
+        sd_box = QGroupBox("StarDist training")
+        sd_layout = QVBoxLayout(sd_box)
+        self._sd_status = QLabel("Training data: — pairs")
+        self._sd_status.setWordWrap(True)
+        sd_layout.addWidget(self._sd_status)
+
+        sd_cfg = QFormLayout()
+        sd_cfg.setContentsMargins(0, 0, 0, 0)
+        self._sd_seg_ch = QSpinBox()
+        self._sd_seg_ch.setRange(0, 7)
+        sd_cfg.addRow("Seg channel:", self._sd_seg_ch)
+        self._sd_epochs = QSpinBox()
+        self._sd_epochs.setRange(10, 1000)
+        self._sd_epochs.setValue(100)
+        sd_cfg.addRow("Epochs:", self._sd_epochs)
+        sd_layout.addLayout(sd_cfg)
+
+        sd_btn_row = QHBoxLayout()
+        self._btn_sd_train = QPushButton("Train StarDist model")
+        self._btn_sd_train.setStyleSheet("font-weight: bold;")
+        self._btn_sd_train.clicked.connect(self._train_stardist)
+        self._btn_sd_refresh = QPushButton("↺ Refresh")
+        self._btn_sd_refresh.clicked.connect(self._update_stardist_status)
+        sd_btn_row.addWidget(self._btn_sd_train)
+        sd_btn_row.addWidget(self._btn_sd_refresh)
+        sd_layout.addLayout(sd_btn_row)
+        layout.addWidget(sd_box)
+
+        # Log
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        layout.addWidget(self._log)
+
+        return w
 
     # ── File list management ──────────────────────────────────────────────────
 
@@ -1219,6 +1195,7 @@ class BatchWidget(QWidget):
         if d:
             self._annot_dir.setText(d)
             self._try_load_classifier()
+            self._update_stardist_status()
 
     # ── Classifier ────────────────────────────────────────────────────────────
 
@@ -1250,6 +1227,104 @@ class BatchWidget(QWidget):
                 "No classifier found. All Cellpose-SAM segments will appear in results. "
                 "Use the single-image widget to curate parasites and build training data."
             )
+
+    def _update_stardist_status(self):
+        """Refresh the StarDist training-data pair count label."""
+        from ._stardist import count_training_pairs
+
+        annot_dir = self._annot_dir.text()
+        if not annot_dir:
+            self._sd_status.setText("Training data: set annotations dir first.")
+            return
+        training_dir = Path(annot_dir) / "training_data"
+        n_vac = count_training_pairs(training_dir, mode="vacuoles")
+        n_para = count_training_pairs(training_dir, mode="parasites")
+        model_dir = Path(annot_dir) / "stardist_model"
+        vac_ready = (model_dir / "vacuoles" / "peredox_vacuoles").exists()
+        para_ready = (model_dir / "parasites" / "peredox_parasites").exists()
+        status = (
+            f"Vacuoles: {n_vac} pairs {'✓' if vac_ready else '(untrained)'}  |  "
+            f"Parasites: {n_para} pairs {'✓' if para_ready else '(untrained)'}"
+        )
+        self._sd_status.setText(status)
+
+    def _train_stardist(self):
+        """Launch StarDist fine-tuning in a background thread."""
+        from ._stardist import count_training_pairs
+
+        annot_dir = self._annot_dir.text()
+        if not annot_dir:
+            self._log_msg("Set the annotations directory before training.")
+            return
+
+        training_dir = Path(annot_dir) / "training_data"
+        n_pairs = count_training_pairs(training_dir, mode="parasites")
+        if n_pairs < 5:
+            self._log_msg(
+                f"Only {n_pairs} parasite training pair(s) — curate more images first "
+                f"(need at least 5; 20+ recommended)."
+            )
+            return
+
+        self._btn_sd_train.setEnabled(False)
+        self._log_msg(
+            f"Starting StarDist training on {n_pairs} pairs "
+            f"({self._sd_epochs.value()} epochs)…"
+        )
+
+        from qtpy.QtCore import QObject, QThread, Signal
+
+        class _StarDistWorker(QObject):
+            progress = Signal(str)
+            finished = Signal(str)  # model path or ""
+            error = Signal(str)
+
+            def __init__(self, params):
+                super().__init__()
+                self.params = params
+
+            def run(self):
+                try:
+                    from napari_peredox._stardist import train_stardist
+
+                    p = self.params
+                    out = train_stardist(
+                        training_dir=p["training_dir"],
+                        model_dir=p["model_dir"],
+                        seg_channel=p["seg_channel"],
+                        n_epochs=p["n_epochs"],
+                        progress_cb=self.progress.emit,
+                    )
+                    self.finished.emit(str(out))
+                except Exception:
+                    import traceback
+
+                    self.error.emit(traceback.format_exc())
+
+        params = {
+            "training_dir": training_dir,
+            "model_dir": Path(annot_dir) / "stardist_model",
+            "seg_channel": self._sd_seg_ch.value(),
+            "n_epochs": self._sd_epochs.value(),
+        }
+        self._sd_thread = QThread()
+        self._sd_worker = _StarDistWorker(params)
+        self._sd_worker.moveToThread(self._sd_thread)
+        self._sd_thread.started.connect(self._sd_worker.run)
+        self._sd_worker.progress.connect(self._log_msg)
+        self._sd_worker.finished.connect(self._on_stardist_done)
+        self._sd_worker.error.connect(self._on_stardist_error)
+        self._sd_worker.finished.connect(self._sd_thread.quit)
+        self._sd_worker.error.connect(self._sd_thread.quit)
+        self._sd_thread.finished.connect(lambda: self._btn_sd_train.setEnabled(True))
+        self._sd_thread.start()
+
+    def _on_stardist_done(self, model_path: str):
+        self._log_msg(f"StarDist training complete — model saved to {model_path}")
+        self._update_stardist_status()
+
+    def _on_stardist_error(self, tb: str):
+        self._log_msg(f"StarDist training failed:\n{tb}")
 
     # ── Batch run ─────────────────────────────────────────────────────────────
 
@@ -1306,8 +1381,11 @@ class BatchWidget(QWidget):
             "replicate": self._replicate.value(),
             "ch_cptsa": self._ch_cptsa.value(),
             "ch_mcherry": self._ch_mcherry.value(),
+            "vac_seg_ch": self._vac_seg_ch.value(),
             "seg_ch": self._seg_ch.value(),
             "use_composite": self._use_composite.isChecked(),
+            "vac_min_area_um2": self._vac_min_area_um2.value(),
+            "vac_max_area_um2": self._vac_max_area_um2.value(),
             "min_area_um2": self._min_area_um2.value(),
             "max_area_um2": self._max_area_um2.value(),
             "max_eccentricity": self._max_eccentricity.value(),
@@ -1329,6 +1407,8 @@ class BatchWidget(QWidget):
             "threshold_channel": self._thresh_channel.value(),
             "threshold_value": self._thresh_value.value(),
             "threshold_percentile": self._thresh_percentile.value(),
+            "seg_backend": self._seg_backend.currentIndex(),  # 0=cpSAM, 1=StarDist
+            "annot_dir": self._annot_dir.text(),
         }
 
         self._btn_run.setEnabled(False)
@@ -1362,12 +1442,14 @@ class BatchWidget(QWidget):
         # Store for use in _on_finished
         self._pending_out_folder = out_folder
 
-        # Pre-load the Cellpose model in the main thread so the CUDA context is
-        # established here before the worker thread starts.  The device name is
-        # written to the log so slow runs can be diagnosed immediately.
-        from ._segment import preload_model
+        if self._seg_backend.currentIndex() == 1:
+            self._log_msg("Using fine-tuned StarDist model for segmentation.")
+        else:
+            # Pre-load the Cellpose model in the main thread so the CUDA context is
+            # established here before the worker thread starts.
+            from ._segment import preload_model
 
-        self._log_msg(preload_model())
+            self._log_msg(preload_model())
 
         self._thread.start()
 
@@ -1390,17 +1472,16 @@ class BatchWidget(QWidget):
         """
         self._progress_bar.setValue(100)
 
-        if result is None or len(result) == 0:
-            self._log_msg("Batch complete — no parasites detected.")
-            self._review_status.setText("Batch complete — no parasites found.")
-            return
-
         # Store raw results and reset any prior curation decisions
         self._result_df = result
         self._curation_decisions = {}
 
-        n_parasites = len(result)
         n_positions = len(curation_list)
+
+        if n_positions == 0:
+            self._log_msg("Batch complete — no vacuoles detected in any position.")
+            self._review_status.setText("Batch complete — no vacuoles found.")
+            return
 
         # Populate curation gallery
         self._curation_data = curation_list
@@ -1408,15 +1489,15 @@ class BatchWidget(QWidget):
         for item in curation_list:
             self._curation_combo.addItem(item["display_name"])
 
-        if curation_list:
-            self._curation_combo.setEnabled(True)
-            self._btn_curate.setEnabled(True)
-            self._btn_save_results.setEnabled(True)
+        self._curation_combo.setEnabled(True)
+        self._btn_curate.setEnabled(True)
+        self._btn_save_results.setEnabled(True)
 
         self._update_review_status()
         self._log_msg(
-            f"Batch complete — {n_parasites} parasite(s) across {n_positions} position(s).\n"
-            f"Review each position, then click 'Save accepted results CSV'."
+            f"Stage 1 complete — {n_positions} position(s) with vacuoles detected.\n"
+            f"Open each position in the curation gallery to review vacuoles, "
+            f"then parasite detection runs interactively during curation."
         )
 
     def _on_error(self, tb: str):
@@ -1444,137 +1525,410 @@ class BatchWidget(QWidget):
             self._curation_combo.setItemText(i, label)
 
     def _open_curation(self):
-        """Open the selected position in the curation gallery."""
+        """
+        Open two-pass curation for the selected position.
+
+        Pass 1 — VacuoleCurationWidget: user reviews whole-vacuole outlines,
+                  accepts/rejects/redraws each detected vacuole.
+        Pass 2 — CurationWidget: after saving vacuole decisions, opens the
+                  per-vacuole parasite gallery for individual parasite review.
+        """
         idx = self._curation_combo.currentIndex()
         if idx < 0 or idx >= len(self._curation_data):
             return
         data = self._curation_data[idx]
-
-        from ._curation import CurationWidget
-
-        def _on_save(decisions: dict, vacuole_assignments: dict | None = None):
-            from ._io import append_curated_annotations
-            from ._learning import extract_features, train_classifier
-
-            # Record decisions for this position so _save_accepted_results can
-            # filter the result DataFrame.
-            key = (data["file"], data["position_name"])
-            self._curation_decisions[key] = decisions
-            self._update_review_status()
-
-            n_accepted = sum(1 for v in decisions.values() if v == 1)
-            n_rejected = sum(1 for v in decisions.values() if v == 0)
-            self._log_msg(
-                f"Review saved — {data['display_name']}: "
-                f"{n_accepted} accepted, {n_rejected} rejected."
-            )
-
-            annot_dir = self._annot_dir.text()
-            feats = extract_features(
-                labels=data["labels"],
-                image=data["image"],
-                seg_channel=self._seg_ch.value(),
-                ch_cptsa=self._ch_cptsa.value(),
-                ch_mcherry=self._ch_mcherry.value(),
-                ch_names={
-                    self._ch_cptsa.value(): "cptsa",
-                    self._ch_mcherry.value(): "mcherry",
-                },
-            )
-            append_curated_annotations(
-                decisions=decisions,
-                features=feats,
-                image_stem=f"{data['file']}_{data['position_name']}",
-                annotations_dir=annot_dir,
-                vacuole_assignments=vacuole_assignments,
-            )
-            try:
-                clf = train_classifier(Path(annot_dir) / "curated_features.csv")
-                if clf is not None:
-                    self._classifier = clf
-                    self._log_msg("Classifier retrained from curation data.")
-            except Exception as exc:
-                self._log_msg(f"Classifier training skipped: {exc}")
-            self._try_load_classifier()
 
         ch_names = {
             self._ch_cptsa.value(): "cptsa",
             self._ch_mcherry.value(): "mcherry",
         }
         px = self._pixel_size.value()
+        annot_dir = self._annot_dir.text()
+        stem = f"{data['file']}_{data['position_name']}"
+        display_name = data["display_name"]
 
-        curation = CurationWidget(
-            labels=data["labels"],
+        # Load image+labels into the napari viewer for context
+        vac_layer_name = display_name.replace(" ", "_") + "_vacuoles"
+        if self._viewer is not None:
+            img_hwc = data["image"]
+            img_chw = np.moveaxis(img_hwc, -1, 0) if img_hwc.ndim == 3 else img_hwc
+            img_layer_name = display_name.replace(" ", "_") + "_image"
+            if img_layer_name in self._viewer.layers:
+                self._viewer.layers[img_layer_name].data = img_chw
+            else:
+                self._viewer.add_image(img_chw, name=img_layer_name, channel_axis=0)
+            if vac_layer_name in self._viewer.layers:
+                self._viewer.layers[vac_layer_name].data = data["vac_labels"]
+            else:
+                self._viewer.add_labels(data["vac_labels"], name=vac_layer_name)
+            self._viewer.reset_view()
+
+        # ── Pass 2 callback — opens after vacuole curation is saved ──────────
+        def _open_parasite_curation(vac_decisions: dict, curated_vac_labels):
+            from qtpy.QtWidgets import QMessageBox
+
+            from ._curation import CurationWidget
+            from ._segment import segment_parasites_in_vacuoles
+
+            # Diagnostic: log the full decision map and what's in the label array
+            ids_in_labels = [int(v) for v in np.unique(curated_vac_labels) if v != 0]
+            self._log_msg(
+                f"  [diag] vac_decisions: { {k: v for k, v in vac_decisions.items()} }"
+            )
+            self._log_msg(f"  [diag] IDs in curated_vac_labels: {ids_in_labels}")
+
+            # Keep only explicitly accepted vacuoles (dec == 1).
+            # Skipped (dec == -1) and rejected (dec == 0) are both zeroed out.
+            accepted_vac = curated_vac_labels.copy()
+            for vid in np.unique(curated_vac_labels):
+                if vid == 0:
+                    continue
+                if vac_decisions.get(int(vid), -1) != 1:
+                    accepted_vac[accepted_vac == vid] = 0
+
+            ids_accepted = [int(v) for v in np.unique(accepted_vac) if v != 0]
+            self._log_msg(f"  [diag] IDs after accept filter: {ids_accepted}")
+
+            n_accepted = int(len([d for d in vac_decisions.values() if d == 1]))
+            if n_accepted == 0:
+                self._log_msg(
+                    f"{display_name}: all vacuoles rejected — nothing to segment."
+                )
+                return
+
+            self._log_msg(
+                f"{display_name}: {n_accepted} vacuoles accepted — running parasite detection…"
+            )
+
+            # Run Stage 2 parasite segmentation on accepted vacuoles
+            try:
+                seg_backend = self._seg_backend.currentIndex()
+                sd_model = None
+                if seg_backend == 0:
+                    # Ensure cpSAM model is loaded in the main thread
+                    from ._segment import preload_model
+
+                    self._log_msg(preload_model())
+                else:
+                    from ._stardist import load_stardist_model
+
+                    sd_model = load_stardist_model(
+                        Path(annot_dir) / "stardist_model", mode="parasites"
+                    )
+                file_px = data.get("file_px", px)
+                min_area_px = (
+                    self._min_area_um2.value() / (file_px**2) if file_px > 0 else 0.0
+                )
+                max_area_px = (
+                    self._max_area_um2.value() / (file_px**2) if file_px > 0 else 1e9
+                )
+                para_labels, vac_map = segment_parasites_in_vacuoles(
+                    image=data["image"],
+                    vac_labels=accepted_vac,
+                    seg_channel=self._seg_ch.value(),
+                    model=sd_model,
+                    min_area_px=min_area_px,
+                    max_area_px=max_area_px,
+                    max_eccentricity=self._max_eccentricity.value(),
+                    min_solidity=self._min_solidity.value(),
+                    progress_cb=self._log_msg,
+                )
+            except Exception as exc:
+                import traceback as _tb
+
+                msg = f"Parasite segmentation failed: {exc}"
+                self._log_msg(msg)
+                self._log_msg(_tb.format_exc())
+                QMessageBox.critical(self, "Segmentation error", msg)
+                return
+
+            # Log per-vacuole parasite counts so missing vacuoles are visible
+            vac_para_counts: dict[int, int] = {}
+            for pid, vid in vac_map.items():
+                vac_para_counts[vid] = vac_para_counts.get(vid, 0) + 1
+            for vid in ids_accepted:
+                count = vac_para_counts.get(vid, 0)
+                self._log_msg(f"  [diag] vac {vid}: {count} parasite(s) found")
+
+            # Measure all parasites — pass the full per-parasite table to
+            # CurationWidget so every vacuole appears in the gallery.
+            # select_one_per_vacuole runs later in _on_para_save, after curation.
+            from ._measure import measure_pvs
+
+            try:
+                meas = measure_pvs(
+                    labels=para_labels,
+                    image=data["image"],
+                    ch_cptsa=self._ch_cptsa.value(),
+                    ch_mcherry=self._ch_mcherry.value(),
+                    ch_names=ch_names,
+                    pixel_size_um=px if px > 0 else None,
+                )
+            except Exception as exc:
+                self._log_msg(f"Measurement failed: {exc}")
+                meas = None
+
+            # Update napari layer to show parasite labels
+            para_layer_name = display_name.replace(" ", "_") + "_parasites"
+            if self._viewer is not None:
+                if para_layer_name in self._viewer.layers:
+                    self._viewer.layers[para_layer_name].data = para_labels
+                else:
+                    self._viewer.add_labels(para_labels, name=para_layer_name)
+
+            def _on_para_save(decisions: dict, vacuole_assignments: dict | None = None):
+                from ._io import append_curated_annotations, save_training_pair
+                from ._learning import extract_features, train_classifier
+                from ._measure import measure_pvs
+
+                key = (data["file"], data["position_name"])
+                self._curation_decisions[key] = decisions
+                data["final_labels"] = para_labels
+                data["final_vac_map"] = vac_map
+                self._update_review_status()
+
+                n_acc = sum(1 for v in decisions.values() if v == 1)
+                n_rej = sum(1 for v in decisions.values() if v == 0)
+                self._log_msg(
+                    f"Parasite review saved — {display_name}: "
+                    f"{n_acc} accepted, {n_rej} rejected."
+                )
+
+                # Measure the whole-PV region (Stage 1 vacuole mask) — one row
+                # per vacuole.  This gives the correct Peredox ratio because the
+                # mCherry signal fills the entire PV lumen, not just parasite blobs.
+                try:
+                    file_px = data.get("file_px", px)
+
+                    # Count accepted parasites per vacuole and collect per-parasite
+                    # ratios so we can compute mean/median per vacuole.
+                    accepted_para = {lbl for lbl, dec in decisions.items() if dec == 1}
+                    para_count_per_vac: dict[int, int] = {}
+                    para_ratios_per_vac: dict[int, list[float]] = {}
+                    if vac_map:
+                        # Measure individual accepted parasites for ratio aggregation
+                        meas_para = measure_pvs(
+                            labels=para_labels,
+                            image=data["image"],
+                            ch_cptsa=self._ch_cptsa.value(),
+                            ch_mcherry=self._ch_mcherry.value(),
+                            ch_names=ch_names,
+                            pixel_size_um=file_px if file_px > 0 else None,
+                        )
+                        for plbl, vid in vac_map.items():
+                            if plbl not in accepted_para:
+                                continue
+                            para_count_per_vac[vid] = para_count_per_vac.get(vid, 0) + 1
+                            if not meas_para.empty and plbl in meas_para.index:
+                                r = meas_para.loc[plbl, "ratio_cptsa_mcherry"]
+                                if not np.isnan(r):
+                                    para_ratios_per_vac.setdefault(vid, []).append(
+                                        float(r)
+                                    )
+
+                    # Measure on vacuole mask — one row per PV, whole-lumen ratio
+                    # (accepted_vac is the filtered Stage 1 label array in scope)
+                    meas_vac = measure_pvs(
+                        labels=accepted_vac,
+                        image=data["image"],
+                        ch_cptsa=self._ch_cptsa.value(),
+                        ch_mcherry=self._ch_mcherry.value(),
+                        ch_names=ch_names,
+                        pixel_size_um=file_px if file_px > 0 else None,
+                    )
+
+                    if not meas_vac.empty:
+                        # Parasite count and per-parasite ratio aggregates
+                        meas_vac["parasites_per_vacuole"] = meas_vac.index.map(
+                            lambda vid: para_count_per_vac.get(vid, 0)
+                        )
+                        meas_vac["mean_parasite_ratio"] = meas_vac.index.map(
+                            lambda vid: (
+                                float(np.mean(para_ratios_per_vac[vid]))
+                                if vid in para_ratios_per_vac
+                                else np.nan
+                            )
+                        )
+                        meas_vac["median_parasite_ratio"] = meas_vac.index.map(
+                            lambda vid: (
+                                float(np.median(para_ratios_per_vac[vid]))
+                                if vid in para_ratios_per_vac
+                                else np.nan
+                            )
+                        )
+                        meas_vac.insert(0, "position_name", data["position_name"])
+                        meas_vac.insert(0, "replicate", data.get("replicate", 1))
+                        meas_vac.insert(0, "cell_line", data.get("cell_line", ""))
+                        meas_vac.insert(0, "treatment", data.get("treatment", ""))
+                        meas_vac.insert(0, "file", data["file"])
+                        meas_vac = meas_vac.reset_index().rename(
+                            columns={"label": "vacuole_id"}
+                        )
+                        if self._result_df is None or self._result_df.empty:
+                            self._result_df = meas_vac
+                        else:
+                            self._result_df = pd.concat(
+                                [self._result_df, meas_vac], ignore_index=True
+                            )
+                        self._log_msg(
+                            f"  Measurements accumulated — {len(self._result_df)} total rows."
+                        )
+                except Exception as exc:
+                    self._log_msg(f"  Measurement failed: {exc}")
+
+                feats = extract_features(
+                    labels=para_labels,
+                    image=data["image"],
+                    seg_channel=self._seg_ch.value(),
+                    ch_cptsa=self._ch_cptsa.value(),
+                    ch_mcherry=self._ch_mcherry.value(),
+                    ch_names=ch_names,
+                )
+                append_curated_annotations(
+                    decisions=decisions,
+                    features=feats,
+                    image_stem=stem,
+                    annotations_dir=annot_dir,
+                    vacuole_assignments=vacuole_assignments,
+                )
+                try:
+                    from ._stardist import count_training_pairs
+
+                    training_dir = Path(annot_dir) / "training_data"
+                    save_training_pair(
+                        image=data["image"],
+                        labels=para_labels,
+                        decisions=decisions,
+                        stem=stem,
+                        training_dir=training_dir,
+                        vacuole_map=vac_map or None,
+                    )
+                    nv = count_training_pairs(training_dir, mode="vacuoles")
+                    np_ = count_training_pairs(training_dir, mode="parasites")
+                    self._log_msg(
+                        f"Training pairs saved — vacuoles: {nv}, parasites: {np_}"
+                    )
+                    self._update_stardist_status()
+                except Exception as exc2:
+                    self._log_msg(f"Training pair save skipped: {exc2}")
+                try:
+                    clf = train_classifier(Path(annot_dir) / "curated_features.csv")
+                    if clf is not None:
+                        self._classifier = clf
+                except Exception:
+                    pass
+                self._try_load_classifier()
+
+            para_win = CurationWidget(
+                labels=para_labels,
+                image=data["image"],
+                measurements=meas,
+                ch_cptsa=self._ch_cptsa.value(),
+                ch_mcherry=self._ch_mcherry.value(),
+                ch_names=ch_names,
+                pixel_size_um=px if px > 0 else None,
+                vacuole_assignments=vac_map or None,
+                accepted_vac_ids=ids_accepted,
+                vac_labels=accepted_vac,
+                on_save=_on_para_save,
+                viewer=self._viewer,
+                labels_layer_name=para_layer_name,
+            )
+            para_win.setWindowTitle(f"Parasites — {display_name}")
+            para_win.resize(360, 580)
+            self._curation_win2 = para_win  # keep strong ref
+
+            if self._viewer is not None:
+                self._viewer.window.add_dock_widget(
+                    para_win,
+                    name=f"Parasites: {display_name}",
+                    area="right",
+                )
+            else:
+                para_win.show()
+
+        # ── Pass 1 — vacuole curation ─────────────────────────────────────────
+        from ._curation import VacuoleCurationWidget
+
+        def _on_vac_save(vac_decisions: dict, curated_vac_labels):
+            n_vac_acc = sum(1 for d in vac_decisions.values() if d == 1)
+            self._log_msg(
+                f"Vacuole review saved — {display_name}: {n_vac_acc} vacuoles accepted."
+            )
+            # Save vacuole training pair
+            try:
+                from ._io import save_training_pair
+                from ._stardist import count_training_pairs
+
+                training_dir = Path(annot_dir) / "training_data"
+                save_training_pair(
+                    image=data["image"],
+                    labels=curated_vac_labels,
+                    decisions=vac_decisions,
+                    stem=stem + "_vac",
+                    training_dir=training_dir,
+                    vacuole_map={
+                        int(v): int(v) for v in np.unique(curated_vac_labels) if v != 0
+                    },
+                )
+                nv = count_training_pairs(training_dir, mode="vacuoles")
+                self._log_msg(f"Vacuole training pairs: {nv}")
+                self._update_stardist_status()
+            except Exception as exc:
+                self._log_msg(f"Vacuole training pair skipped: {exc}")
+            # Defer opening parasite curation to the next event-loop tick so
+            # the vacuole widget's save signal has fully unwound before we
+            # open a new dock widget.
+            from qtpy.QtCore import QTimer
+
+            QTimer.singleShot(
+                0,
+                lambda vd=vac_decisions, cvl=curated_vac_labels: (
+                    _open_parasite_curation(vd, cvl)
+                ),
+            )
+
+        vac_win = VacuoleCurationWidget(
+            vac_labels=data["vac_labels"],
             image=data["image"],
-            measurements=data["measurements"],
             ch_cptsa=self._ch_cptsa.value(),
             ch_mcherry=self._ch_mcherry.value(),
-            ch_names=ch_names,
-            pixel_size_um=px if px > 0 else None,
-            vacuole_assignments=data.get("vac_map") or None,
-            on_save=_on_save,
+            on_save=_on_vac_save,
+            viewer=self._viewer,
+            labels_layer_name=vac_layer_name,
         )
-        curation.setWindowTitle(f"Curation — {data['display_name']}")
-        curation.resize(340, 560)
+        vac_win.setWindowTitle(f"Vacuoles — {display_name}")
+        vac_win.resize(360, 520)
+        self._curation_win = vac_win  # keep strong ref
 
-        # Keep a strong reference so the widget is not garbage-collected when
-        # this method returns (which would make the window vanish immediately).
-        self._curation_win = curation
-
-        # Dock into napari if viewer is available, otherwise show as window
         if self._viewer is not None:
             self._viewer.window.add_dock_widget(
-                curation,
-                name=f"Curation: {data['display_name']}",
+                vac_win,
+                name=f"Vacuoles: {display_name}",
                 area="right",
             )
         else:
-            curation.show()
+            vac_win.show()
 
     def _save_accepted_results(self):
-        """
-        Write results.csv containing only accepted parasites.
-
-        For each position that was reviewed, parasites explicitly rejected
-        (decision == 0) are excluded.  Positions not yet reviewed keep all
-        detected parasites (default-accept policy — don't penalise partial QC).
-        """
+        """Write results.csv from measurements accumulated during curation."""
         if self._result_df is None or self._result_df.empty:
-            self._log_msg("No results to save — run batch first.")
+            self._log_msg(
+                "No results to save — complete curation for at least one position first."
+            )
             return
 
         out_folder = self._pending_out_folder
         out_folder.mkdir(parents=True, exist_ok=True)
 
         df = self._result_df.copy()
-        n_before = len(df)
-        rows_to_drop = []
-
-        for i, row in df.iterrows():
-            key = (row["file"], row["position_name"])
-            if key not in self._curation_decisions:
-                continue  # not reviewed → keep
-            decisions = self._curation_decisions[key]
-            label = int(row["parasite_label"])
-            if decisions.get(label) == 0:
-                rows_to_drop.append(i)
-
-        df = df.drop(index=rows_to_drop)
-        n_after = len(df)
-        n_rejected = n_before - n_after
-
         csv_path = out_folder / "results.csv"
         if csv_path.exists():
             df.to_csv(csv_path, mode="a", header=False, index=False)
-            self._log_msg(
-                f"Appended {n_after} row(s) to existing {csv_path} "
-                f"({n_rejected} rejected excluded)."
-            )
+            self._log_msg(f"Appended {len(df)} row(s) to existing {csv_path}.")
         else:
             df.to_csv(csv_path, index=False)
-            self._log_msg(
-                f"Saved {n_after} row(s) → {csv_path} ({n_rejected} rejected excluded)."
-            )
+            self._log_msg(f"Saved {len(df)} row(s) → {csv_path}.")
 
     def _log_msg(self, msg: str):
         self._log.append(msg)
