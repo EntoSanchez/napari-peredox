@@ -412,6 +412,7 @@ class VacuoleCurationWidget(QWidget):
         on_save: Callable | None = None,
         viewer=None,
         labels_layer_name: str | None = None,
+        object_name: str = "vacuole",
         parent=None,
     ):
         super().__init__(parent)
@@ -422,6 +423,7 @@ class VacuoleCurationWidget(QWidget):
         self._on_save = on_save
         self._viewer = viewer
         self._labels_layer_name = labels_layer_name
+        self._object_name = object_name
 
         self._vac_ids: list[int] = sorted(
             int(v) for v in np.unique(self._labels) if v != 0
@@ -491,7 +493,9 @@ class VacuoleCurationWidget(QWidget):
         dp_layout = QVBoxLayout(self._draw_panel)
         dp_layout.setContentsMargins(0, 0, 0, 0)
         dp_layout.setSpacing(4)
-        self._draw_info = QLabel("Click ✏ Draw outline to redraw the vacuole boundary.")
+        self._draw_info = QLabel(
+            f"Click ✏ Draw outline to redraw the {self._object_name} boundary."
+        )
         self._draw_info.setAlignment(Qt.AlignCenter)
         self._draw_info.setStyleSheet("color: #888888; font-style: italic;")
         self._draw_info.setWordWrap(True)
@@ -510,7 +514,10 @@ class VacuoleCurationWidget(QWidget):
         self._status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._status_label)
 
-        self._btn_save = QPushButton("💾 Save & retrain vacuole model")
+        if self._object_name == "vacuole":
+            self._btn_save = QPushButton("💾 Save & retrain vacuole model")
+        else:
+            self._btn_save = QPushButton(f"💾 Save {self._object_name} review")
         self._btn_save.clicked.connect(self._save)
         layout.addWidget(self._btn_save)
 
@@ -582,7 +589,9 @@ class VacuoleCurationWidget(QWidget):
         self._drawing = False
         self._thumb.stop()
         self._draw_panel.setEnabled(False)
-        self._draw_info.setText("Click ✏ Draw outline to redraw the vacuole boundary.")
+        self._draw_info.setText(
+            f"Click ✏ Draw outline to redraw the {self._object_name} boundary."
+        )
         self._draw_info.setStyleSheet("color: #888888; font-style: italic;")
         self._btn_draw.setEnabled(True)
 
@@ -590,7 +599,9 @@ class VacuoleCurationWidget(QWidget):
         """Apply the drawn polygon as the new mask for the current vacuole."""
         self._drawing = False
         self._draw_panel.setEnabled(False)
-        self._draw_info.setText("Click ✏ Draw outline to redraw the vacuole boundary.")
+        self._draw_info.setText(
+            f"Click ✏ Draw outline to redraw the {self._object_name} boundary."
+        )
         self._draw_info.setStyleSheet("color: #888888; font-style: italic;")
         self._btn_draw.setEnabled(True)
 
@@ -632,7 +643,7 @@ class VacuoleCurationWidget(QWidget):
     def _refresh(self) -> None:
         n = len(self._vac_ids)
         if n == 0:
-            self._lbl_nav.setText("No vacuoles")
+            self._lbl_nav.setText(f"No {self._object_name}s")
             self._info_label.setText("")
             self._thumb.stop()
             self._update_status()
@@ -640,7 +651,9 @@ class VacuoleCurationWidget(QWidget):
 
         idx = self._current_idx
         vac_id = self._vac_ids[idx]
-        self._lbl_nav.setText(f"Vacuole {idx + 1} / {n}  (id={vac_id})")
+        self._lbl_nav.setText(
+            f"{self._object_name.capitalize()} {idx + 1} / {n}  (id={vac_id})"
+        )
 
         others = [v for v in self._vac_ids if v != vac_id]
         thumb, _crop = _make_thumbnail(
