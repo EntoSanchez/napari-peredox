@@ -2038,11 +2038,117 @@ class PeredoxWidget(QWidget):
         self._update_clf_status()
         self._lbl_host_measure.setText("Parasites curated — ready to measure.")
 
+    # ── Stage H3: assignment, measurement, export ────────────────────────────
+
     def _run_host_measure(self) -> None:
-        self._log_msg("Stage H3 not implemented yet (Task 11).")
+        if self._host_labels is None:
+            self._log_msg("Run Stage H1 first.")
+            return
+        if self._host_para_labels is None:
+            # Zero parasites is valid — an uninfected control image (spec §7)
+            self._host_para_labels = np.zeros_like(self._host_labels)
+            self._host_vac_map = {}
+            self._log_msg("No Stage H2 parasites — measuring hosts as uninfected.")
+        try:
+            image = self._get_image_array()
+        except RuntimeError as exc:
+            self._log_msg(f"Error: {exc}")
+            return
+
+        n_ch = image.shape[-1]
+        ch_names = {i: f"ch{i}" for i in range(n_ch)}
+        ch_names[self._ch_cptsa.value()] = "cptsa"
+        ch_names[self._ch_mcherry.value()] = "mcherry"
+        px = self._pixel_size.value()
+
+        from ._host import assign_to_hosts, measure_hosts
+
+        para_to_host, vac_to_host, dropped = assign_to_hosts(
+            self._host_para_labels,
+            self._host_labels,
+            self._host_vac_map if self._host_vac_map else None,
+        )
+        if dropped:
+            self._log_msg(
+                f"{len(dropped)} parasite(s) had no host majority and were "
+                f"dropped from host statistics: labels {sorted(dropped)}"
+            )
+
+        hosts_df = measure_hosts(
+            host_labels=self._host_labels,
+            para_labels=self._host_para_labels,
+            image=image,
+            para_to_host=para_to_host,
+            vac_to_host=vac_to_host,
+            dilation_px=self._host_dilation_px.value(),
+            ch_cptsa=self._ch_cptsa.value(),
+            ch_mcherry=self._ch_mcherry.value(),
+            ch_names=ch_names,
+            pixel_size_um=px if px > 0 else None,
+        )
+        self._host_measurements = hosts_df
+
+        # Tag each parasite row with its host
+        if (
+            self._host_para_measurements is not None
+            and not self._host_para_measurements.empty
+        ):
+            self._host_para_measurements = self._host_para_measurements.copy()
+            self._host_para_measurements["host_id"] = (
+                self._host_para_measurements.index.map(para_to_host)
+            )
+
+        n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
+        n_tot = len(hosts_df)
+        n_empty = int(hosts_df["cytosol_empty"].sum()) if not hosts_df.empty else 0
+        msg = f"{n_tot} hosts measured — {n_inf} infected, {n_tot - n_inf} uninfected."
+        if n_empty:
+            msg += f" {n_empty} host(s) fully covered by parasites (NaN ratio)."
+        self._lbl_host_measure.setText(msg)
+        self._log_msg(f"Stage H3 done: {msg}")
+        self._btn_host_export.setEnabled(True)
+
+        # Show the host table (reuse the PV table window pattern)
+        df = hosts_df.reset_index()
+        win = QWidget(self, Qt.Window)
+        win.setWindowTitle("Host Measurements")
+        win.resize(1000, 400)
+        layout = QVBoxLayout(win)
+        table = QTableWidget(len(df), len(df.columns))
+        table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        for row_idx, row in df.iterrows():
+            for col_idx, val in enumerate(row):
+                item = QTableWidgetItem(
+                    f"{val:.4f}" if isinstance(val, float) else str(val)
+                )
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row_idx, col_idx, item)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        layout.addWidget(table)
+        win.show()
 
     def _export_host_csv(self) -> None:
-        self._log_msg("Host export not implemented yet (Task 11).")
+        from ._io import save_labels, save_measurements
+
+        if self._host_measurements is None:
+            self._log_msg("Run Stage H3 measurement first.")
+            return
+        annot_dir = self._annot_dir.text()
+        stem = self._image_stem
+        # Stem suffixes produce the spec §3 filenames via the existing helpers:
+        # <stem>_host_measurements.csv, <stem>_host_labels.tif, etc.
+        host_csv = save_measurements(self._host_measurements, f"{stem}_host", annot_dir)
+        save_labels(self._host_labels, f"{stem}_host", annot_dir)
+        if (
+            self._host_para_measurements is not None
+            and not self._host_para_measurements.empty
+        ):
+            save_measurements(
+                self._host_para_measurements, f"{stem}_host_parasite", annot_dir
+            )
+        if self._host_para_labels is not None and self._host_para_labels.max() > 0:
+            save_labels(self._host_para_labels, f"{stem}_host_parasite", annot_dir)
+        self._log_msg(f"Host results saved → {host_csv}")
 
 
 # ---------------------------------------------------------------------------
