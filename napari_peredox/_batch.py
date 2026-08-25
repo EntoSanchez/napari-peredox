@@ -2158,6 +2158,9 @@ class BatchWidget(QWidget):
 
     def _load_host_classifier_if_requested(self):
         """Host classifier for batch host mode; None when unavailable/not requested."""
+        mode_combo = getattr(self, "_analysis_mode", None)
+        if mode_combo is None or mode_combo.currentIndex() != 1:
+            return None
         if not self._use_classifier.isChecked():
             return None
         from ._learning import load_classifier
