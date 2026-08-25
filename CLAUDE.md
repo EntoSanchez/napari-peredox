@@ -58,7 +58,7 @@ _curation.py ← Curation UI
                CurationWidget             scrollable gallery: thumbnail + accept/reject
                make_curation_widget()     napari entry point (placeholder)
                VacuoleCurationWidget      accepts object_name: str = "vacuole" —
-                                           set to "host" for host-cell review
+                                           set to "host cell" for host review
                                            (window title/buttons/status only; no
                                            behavioral change)
 
@@ -129,11 +129,14 @@ Stages run in order, each gated behind the previous one's save/completion:
 
 1. **Stage H1 — segment host cells** (`_run_host_stage1` → `_host.segment_host_cells()`
    on a dedicated `_HostWorker` / `_host_thread`, never the PV worker/thread).
-   Host channel (default mCherry), clip percentile (default 99.0), cpSAM
-   diameter/flow/cellprob, and host area gates (µm²) are all set in this tab.
+   Host-tab widgets: host channel (default mCherry), clip percentile
+   (default 99.0), cpSAM diameter, host area gates (µm²), and the parasite
+   exclusion buffer (px). Flow/cellprob thresholds are not duplicated in the
+   Host tab — Stage H1 reuses the Setup tab's shared cpSAM `flow_threshold` /
+   `cellprob_threshold` spinboxes.
    Area gate only — no eccentricity/solidity filter (spread U2OS fail those).
 2. **Review hosts** (`_open_host_curation`) — the same accept/reject/redraw
-   gallery as PV curation (`VacuoleCurationWidget(object_name="host")`).
+   gallery as PV curation (`VacuoleCurationWidget(object_name="host cell")`).
    Saving appends to `curated_host_features.csv` and retrains
    `curated_host_features.joblib` once both classes have enough examples —
    entirely separate from the PV classifier/CSV. **Stage H2 stays disabled
@@ -152,11 +155,12 @@ Stages run in order, each gated behind the previous one's save/completion:
 
 ### Batch mode (`_batch.py`)
 
-`BatchWidget` has an **Analysis mode** dropdown: "Vacuoles/PVs" (existing
+`BatchWidget` has an **Analysis mode** dropdown: "Vacuoles / PVs" (existing
 behavior, default) or "Host cells". In host mode, `_BatchWorker._process_host_position()`
-runs H1 → H2 → H3 automatically for every position (classifier-filtered at
-each stage when a trained classifier is available), with host-mask review
-per position via the same curation gallery used for PV batch review. Output
+runs H1 → H2 → H3 automatically for every position; the host classifier (when
+trained) filters Stage H1 only — Stage H2 parasite detection in batch host
+mode is not classifier-filtered. Host-mask review happens per position via
+the same curation gallery used for PV batch review. Output
 folder gets `hosts.csv` and `host_parasites.csv` (one row per host / per
 parasite across all positions), plus per-position `*_host_mask.tif` /
 `*_host_para_mask.tif` label images alongside the existing PV batch outputs.
