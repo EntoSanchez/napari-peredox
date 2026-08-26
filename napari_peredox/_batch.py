@@ -732,11 +732,13 @@ class _BatchWorker(QObject):
             vac_min_px, vac_max_px = 0.0, 1e9
 
         # ── Stage H1: hosts (+ optional host classifier) ─────────────────────
+        # Host diameter comes from the Host-box spinbox, never from the
+        # parasite/vacuole diameter (which is hidden in host-only mode).
         host_labels, _, hstats = segment_host_cells(
             image=image,
             channel_index=p.get("host_ch", ch_mcherry),
             clip_percentile=p.get("clip_percentile", 99.0),
-            diameter=p.get("diameter"),
+            diameter=p.get("host_diameter"),
             flow_threshold=p.get("flow_threshold", 0.4),
             cellprob_threshold=p.get("cellprob_threshold", 0.0),
             min_area_px=host_min_px,
@@ -1301,6 +1303,16 @@ class BatchWidget(QWidget):
         self._host_clip_pct.setValue(99.0)
         host_form.addRow("Clip percentile:", self._host_clip_pct)
 
+        self._host_diameter = QSpinBox()
+        self._host_diameter.setRange(0, 2000)
+        self._host_diameter.setValue(0)
+        self._host_diameter.setSpecialValueText("auto")
+        self._host_diameter.setToolTip(
+            "Expected host-cell diameter in px (0 = auto). Independent of the\n"
+            "parasite/vacuole diameter above, which is hidden in host-only mode."
+        )
+        host_form.addRow("Host diameter (px):", self._host_diameter)
+
         self._host_min_area_um2 = QDoubleSpinBox()
         self._host_min_area_um2.setRange(0.0, 1e6)
         self._host_min_area_um2.setDecimals(0)
@@ -1728,6 +1740,12 @@ class BatchWidget(QWidget):
                 self._pixel_size.setValue(val)
                 self._log_msg(f"Pixel size set to {val:.4f} µm/px.")
 
+        analysis_mode = self._current_analysis_mode()
+        # In host-only mode the parasite/vacuole settings group is hidden —
+        # its widgets must not silently influence host segmentation, so the
+        # shared cpSAM flow/cellprob fall back to their defaults there.
+        hidden_pv_settings = analysis_mode == "host_only"
+
         params = {
             "source_type": source_type,
             "nd2_paths": nd2_paths,
@@ -1752,8 +1770,10 @@ class BatchWidget(QWidget):
             ),
             "out_folder": out_folder,
             "diameter": self._diameter.value() if self._diameter.value() > 0 else None,
-            "flow_threshold": self._flow_thresh.value(),
-            "cellprob_threshold": self._cellprob_thresh.value(),
+            "flow_threshold": 0.4 if hidden_pv_settings else self._flow_thresh.value(),
+            "cellprob_threshold": (
+                0.0 if hidden_pv_settings else self._cellprob_thresh.value()
+            ),
             "group_vacuoles": self._group_vacuoles.isChecked(),
             "dilation_px": self._dilation_px.value(),
             "vacuole_method": self._vacuole_method.currentText(),
@@ -1765,7 +1785,12 @@ class BatchWidget(QWidget):
             "threshold_percentile": self._thresh_percentile.value(),
             "seg_backend": self._seg_backend.currentIndex(),  # 0=cpSAM, 1=StarDist
             "annot_dir": self._annot_dir.text(),
-            "analysis_mode": self._current_analysis_mode(),
+            "analysis_mode": analysis_mode,
+            "host_diameter": (
+                float(self._host_diameter.value())
+                if self._host_diameter.value() > 0
+                else None
+            ),
             "host_ch": getattr(self, "_host_ch", None).value()
             if getattr(self, "_host_ch", None)
             else 1,
@@ -1815,7 +1840,10 @@ class BatchWidget(QWidget):
         # Store for use in _on_finished
         self._pending_out_folder = out_folder
 
-        if self._seg_backend.currentIndex() == 1:
+        # Host modes always run Cellpose for Stage H1, regardless of the
+        # (possibly hidden) StarDist backend selection — preload it so the
+        # CUDA context is established in the main thread.
+        if self._seg_backend.currentIndex() == 1 and analysis_mode == "pv":
             self._log_msg("Using fine-tuned StarDist model for segmentation.")
         else:
             # Pre-load the Cellpose model in the main thread so the CUDA context is
@@ -1928,9 +1956,13 @@ class BatchWidget(QWidget):
         """Refresh the '0/N reviewed' label and mark reviewed positions in the combo."""
         n_total = len(self._curation_data)
         n_reviewed = len(self._curation_decisions)
+        if self._curation_data and self._curation_data[0].get("mode") == "host":
+            kept = "host cells"
+        else:
+            kept = "parasites"
         self._review_status.setText(
             f"{n_reviewed}/{n_total} position(s) reviewed. "
-            f"Unreviewed positions keep all detected parasites."
+            f"Unreviewed positions keep all detected {kept}."
         )
         # Mark reviewed items in the combo with a checkmark
         for i, item in enumerate(self._curation_data):

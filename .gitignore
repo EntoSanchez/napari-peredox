@@ -49,3 +49,6 @@ desktop.ini
 # Distribution artifacts
 *.whl
 *.tar.gz
+
+# Superpowers workflow scratch (review packages, SDD ledgers)
+.superpowers/

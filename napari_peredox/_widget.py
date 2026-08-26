@@ -1647,15 +1647,35 @@ class PeredoxWidget(QWidget):
 
         def _on_host_only_toggled(checked: bool) -> None:
             self._host_h2_box.setVisible(not checked)
+            if not self._btn_host_stage1.isEnabled():
+                # A host worker is live (Stage H1 or H2 running) — leave the
+                # downstream buttons locked; the worker's done/error callback
+                # sets the correct states for the new mode.
+                self._btn_host_stage2.setEnabled(False)
+                self._btn_host_measure.setEnabled(False)
+                return
             if checked:
                 ready = self._host_labels is not None and self._host_review_saved
+                self._btn_host_stage2.setEnabled(False)
                 self._btn_host_measure.setEnabled(ready)
                 if ready:
                     self._lbl_host_measure.setText("Host-only mode — ready to measure.")
             else:
+                h2_ready = (
+                    self._host_labels is not None
+                    and self._host_labels.max() > 0
+                    and self._host_review_saved
+                )
+                self._btn_host_stage2.setEnabled(bool(h2_ready))
+                if h2_ready:
+                    self._lbl_host_stage2.setText("Ready — click to detect parasites.")
                 self._btn_host_measure.setEnabled(self._host_para_labels is not None)
                 if self._host_para_labels is None:
                     self._lbl_host_measure.setText("Complete Stages H1–H2 first.")
+                else:
+                    self._lbl_host_measure.setText(
+                        "Ready — assign parasites and measure hosts."
+                    )
 
         self._host_only.toggled.connect(_on_host_only_toggled)
 
@@ -1982,6 +2002,17 @@ class PeredoxWidget(QWidget):
         features,
         para_measurements,
     ) -> None:
+        if self._host_only.isChecked():
+            # Host-only mode was enabled while this worker ran — its parasite
+            # results must not enter the analysis.
+            self._log_msg(
+                "Stage H2 finished after host-only mode was enabled — "
+                "results discarded."
+            )
+            self._btn_host_stage1.setEnabled(True)
+            self._btn_host_stage2.setEnabled(False)
+            self._btn_host_stage2.setText("▶ Segment parasites in hosts")
+            return
         self._host_para_labels = para_labels
         self._host_vac_map = vacuole_map
         self._host_features = features
@@ -2098,17 +2129,27 @@ class PeredoxWidget(QWidget):
             return
         host_only = self._host_only.isChecked()
         if host_only:
-            # Host-only mode: parasites are never looked for; any Stage-H2
-            # results from before the checkbox was ticked are discarded.
-            self._host_para_labels = np.zeros_like(self._host_labels)
+            # Host-only mode: parasites are never looked for.  Any Stage-H2
+            # state is discarded rather than replaced with zeros — a stored
+            # zeros array would later masquerade as real H2 output if the
+            # checkbox were unticked, exporting fabricated "infected=False"
+            # rows for hosts that were never assessed.
+            self._host_para_labels = None
             self._host_vac_map = {}
             self._host_para_measurements = None
+            para_labels = np.zeros_like(self._host_labels)
+            layer_name = f"{self._image_stem}_host_parasites"
+            if layer_name in self._viewer.layers:
+                self._viewer.layers[layer_name].data = para_labels
             self._log_msg("Host-only mode — parasite detection skipped.")
         elif self._host_para_labels is None:
             # Zero parasites is valid — an uninfected control image (spec §7)
             self._host_para_labels = np.zeros_like(self._host_labels)
             self._host_vac_map = {}
             self._log_msg("No Stage H2 parasites — measuring hosts as uninfected.")
+            para_labels = self._host_para_labels
+        else:
+            para_labels = self._host_para_labels
         try:
             image = self._get_image_array()
         except RuntimeError as exc:
@@ -2128,7 +2169,7 @@ class PeredoxWidget(QWidget):
             vac_to_host: dict[int, int] = {}
         else:
             para_to_host, vac_to_host, dropped = assign_to_hosts(
-                self._host_para_labels,
+                para_labels,
                 self._host_labels,
                 self._host_vac_map if self._host_vac_map else None,
             )
@@ -2140,7 +2181,7 @@ class PeredoxWidget(QWidget):
 
         hosts_df = measure_hosts(
             host_labels=self._host_labels,
-            para_labels=self._host_para_labels,
+            para_labels=para_labels,
             image=image,
             para_to_host=para_to_host,
             vac_to_host=vac_to_host,
@@ -2219,15 +2260,18 @@ class PeredoxWidget(QWidget):
         # <stem>_host_measurements.csv, <stem>_host_labels.tif, etc.
         host_csv = save_measurements(self._host_measurements, f"{stem}_host", annot_dir)
         save_labels(self._host_labels, f"{stem}_host", annot_dir)
-        if (
-            self._host_para_measurements is not None
-            and not self._host_para_measurements.empty
-        ):
-            save_measurements(
-                self._host_para_measurements, f"{stem}_host_parasite", annot_dir
-            )
-        if self._host_para_labels is not None and self._host_para_labels.max() > 0:
-            save_labels(self._host_para_labels, f"{stem}_host_parasite", annot_dir)
+        # In host-only mode parasites were never assessed — never write
+        # parasite files, even if stray Stage-H2 state survived a race.
+        if not self._host_only.isChecked():
+            if (
+                self._host_para_measurements is not None
+                and not self._host_para_measurements.empty
+            ):
+                save_measurements(
+                    self._host_para_measurements, f"{stem}_host_parasite", annot_dir
+                )
+            if self._host_para_labels is not None and self._host_para_labels.max() > 0:
+                save_labels(self._host_para_labels, f"{stem}_host_parasite", annot_dir)
         self._log_msg(f"Host results saved → {host_csv}")
 
 
