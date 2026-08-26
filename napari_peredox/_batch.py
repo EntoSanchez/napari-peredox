@@ -906,6 +906,12 @@ class _BatchWorker(QObject):
                 "cell_line": p["cell_line"],
                 "replicate": p["replicate"],
                 "pos_idx": pos_idx,
+                # Channels as used by THIS run — the review save must not read
+                # live spinboxes, which the user may have retuned for a later
+                # run before saving a pending review.
+                "host_ch": p.get("host_ch", ch_mcherry),
+                "ch_cptsa": ch_cptsa,
+                "ch_mcherry": ch_mcherry,
             }
         )
 
@@ -2415,9 +2421,14 @@ class BatchWidget(QWidget):
                 para_to_host, vac_to_host, _dropped = assign_to_hosts(
                     item["para_labels"], hosts, item.get("vac_map") or None
                 )
+            # Channels as captured at run time — never the live spinboxes,
+            # which the user may have retuned for a later run before saving
+            # this (asynchronous) review.
+            ch_cptsa = item.get("ch_cptsa", self._ch_cptsa.value())
+            ch_mcherry = item.get("ch_mcherry", self._ch_mcherry.value())
             ch_names = {0: "ch0", 1: "ch1"}
-            ch_names[self._ch_cptsa.value()] = "cptsa"
-            ch_names[self._ch_mcherry.value()] = "mcherry"
+            ch_names[ch_cptsa] = "cptsa"
+            ch_names[ch_mcherry] = "mcherry"
             file_px = item["file_px"]
             hosts_df = measure_hosts(
                 host_labels=hosts,
@@ -2426,8 +2437,8 @@ class BatchWidget(QWidget):
                 para_to_host=para_to_host,
                 vac_to_host=vac_to_host,
                 dilation_px=self._host_dilation_px.value(),
-                ch_cptsa=self._ch_cptsa.value(),
-                ch_mcherry=self._ch_mcherry.value(),
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
                 ch_names=ch_names,
                 pixel_size_um=file_px if file_px > 0 else None,
             )
@@ -2440,8 +2451,8 @@ class BatchWidget(QWidget):
                 para_df = measure_pvs(
                     labels=item["para_labels"],
                     image=item["image"],
-                    ch_cptsa=self._ch_cptsa.value(),
-                    ch_mcherry=self._ch_mcherry.value(),
+                    ch_cptsa=ch_cptsa,
+                    ch_mcherry=ch_mcherry,
                     ch_names=ch_names,
                     pixel_size_um=file_px if file_px > 0 else None,
                 )
@@ -2477,9 +2488,9 @@ class BatchWidget(QWidget):
                 feats = extract_features(
                     labels=curated_hosts,
                     image=item["image"],
-                    seg_channel=self._host_ch.value(),
-                    ch_cptsa=self._ch_cptsa.value(),
-                    ch_mcherry=self._ch_mcherry.value(),
+                    seg_channel=item.get("host_ch", self._host_ch.value()),
+                    ch_cptsa=ch_cptsa,
+                    ch_mcherry=ch_mcherry,
                     ch_names=ch_names,
                 )
                 host_stem = (
