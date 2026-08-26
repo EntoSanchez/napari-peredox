@@ -734,6 +734,12 @@ class _BatchWorker(QObject):
         # ── Stage H1: hosts (+ optional host classifier) ─────────────────────
         # Host diameter comes from the Host-box spinbox, never from the
         # parasite/vacuole diameter (which is hidden in host-only mode).
+        self.progress.emit(
+            pos_idx,
+            total,
+            "    Segmenting host cells (cpSAM — up to a few minutes on busy "
+            "fields or a shared GPU)…",
+        )
         host_labels, _, hstats = segment_host_cells(
             image=image,
             channel_index=p.get("host_ch", ch_mcherry),
@@ -774,6 +780,9 @@ class _BatchWorker(QObject):
             para_labels = np.zeros_like(host_labels)
             vac_map: dict[int, int] = {}
         else:
+            self.progress.emit(
+                pos_idx, total, "    Detecting parasites inside hosts (cpSAM)…"
+            )
             masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
             vac_labels, _, _ = segment_pvs(
                 image=masked,
