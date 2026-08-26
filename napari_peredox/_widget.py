@@ -1807,13 +1807,27 @@ class PeredoxWidget(QWidget):
         self._btn_host_stage1.setText("▶ Segment host cells")
         self._btn_host_review.setEnabled(True)
 
+    def _host_only_ready(self) -> bool:
+        """Accepted, review-saved hosts exist — host-only Measure may run."""
+        return (
+            self._host_labels is not None
+            and self._host_labels.max() > 0
+            and self._host_review_saved
+        )
+
     def _on_host_worker_error(self, msg: str) -> None:
         self._log_msg(f"Error:\n{msg}")
         self._btn_host_stage1.setEnabled(True)
         self._btn_host_stage1.setText("▶ Segment host cells")
-        self._btn_host_stage2.setEnabled(
-            self._host_labels is not None and self._host_review_saved
-        )
+        if self._host_only.isChecked():
+            self._btn_host_stage2.setEnabled(False)
+            self._btn_host_measure.setEnabled(self._host_only_ready())
+            if self._host_only_ready():
+                self._lbl_host_measure.setText("Host-only mode — ready to measure.")
+        else:
+            self._btn_host_stage2.setEnabled(
+                self._host_labels is not None and self._host_review_saved
+            )
         self._btn_host_stage2.setText("▶ Segment parasites in hosts")
 
     # ── Host curation ────────────────────────────────────────────────────────
@@ -2012,6 +2026,9 @@ class PeredoxWidget(QWidget):
             self._btn_host_stage1.setEnabled(True)
             self._btn_host_stage2.setEnabled(False)
             self._btn_host_stage2.setText("▶ Segment parasites in hosts")
+            self._btn_host_measure.setEnabled(self._host_only_ready())
+            if self._host_only_ready():
+                self._lbl_host_measure.setText("Host-only mode — ready to measure.")
             return
         self._host_para_labels = para_labels
         self._host_vac_map = vacuole_map
