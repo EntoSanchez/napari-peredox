@@ -533,7 +533,7 @@ class _BatchWorker(QObject):
                             f"    WARNING: could not save MIP: {exc}",
                         )
 
-                if analysis_mode == "host":
+                if analysis_mode in ("host", "host_only"):
                     try:
                         self._process_host_position(
                             p,
@@ -669,7 +669,7 @@ class _BatchWorker(QObject):
 
             # Worker emits an empty DataFrame for now — results are built during
             # interactive curation and saved via _save_accepted_results.
-            if analysis_mode == "host":
+            if analysis_mode in ("host", "host_only"):
                 self.finished.emit(host_results, curation_list)
             else:
                 self.finished.emit(pd.DataFrame(), curation_list)
@@ -690,12 +690,23 @@ class _BatchWorker(QObject):
         host_results,
         curation_list,
     ):
-        """Full auto host pipeline for one position: H1 → H2 → H3 (spec §5)."""
-        from ._host import assign_to_hosts, measure_hosts, segment_host_cells
+        """Full auto host pipeline for one position: H1 → H2 → H3 (spec §5).
+
+        In host-only mode (analysis_mode == "host_only") Stage H2 is skipped
+        entirely: no parasite detection, no assignment, and the hosts table is
+        exported without the parasite-assessment columns.
+        """
+        from ._host import (
+            assign_to_hosts,
+            drop_infection_columns,
+            measure_hosts,
+            segment_host_cells,
+        )
         from ._measure import measure_pvs
         from ._segment import segment_parasites_in_vacuoles, segment_pvs
 
-        if p.get("seg_backend", 0) == 1:
+        host_only = p.get("analysis_mode") == "host_only"
+        if p.get("seg_backend", 0) == 1 and not host_only:
             self.progress.emit(
                 pos_idx,
                 total,
@@ -756,49 +767,58 @@ class _BatchWorker(QObject):
             return
 
         # ── Stage H2: parasites inside hosts (auto) ──────────────────────────
-        masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
-        vac_labels, _, _ = segment_pvs(
-            image=masked,
-            channel_index=p.get("vac_seg_ch", 1),
-            use_composite=p.get("use_composite", False),
-            min_area_px=vac_min_px,
-            max_area_px=vac_max_px,
-            max_eccentricity=p.get("max_eccentricity", 0.85),
-            min_solidity=p.get("min_solidity", 0.70),
-            diameter=None,
-            flow_threshold=p.get("flow_threshold", 0.4),
-            cellprob_threshold=p.get("cellprob_threshold", 0.0),
-            threshold_method=p.get("threshold_method", "none"),
-            threshold_channel=p.get("threshold_channel", p.get("vac_seg_ch", 1)),
-            threshold_value=p.get("threshold_value", 0.0),
-            threshold_percentile=p.get("threshold_percentile", 50.0),
-        )
-        para_labels, vac_map = segment_parasites_in_vacuoles(
-            image=masked,
-            vac_labels=vac_labels,
-            seg_channel=p.get("seg_ch", 0),
-            model=None,
-            min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
-            if file_px > 0
-            else 0.0,
-            max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
-            if file_px > 0
-            else 1e9,
-            max_eccentricity=p.get("max_eccentricity", 0.85),
-            min_solidity=p.get("min_solidity", 0.70),
-        )
+        if host_only:
+            # Host-only mode: parasites are never looked for.
+            para_labels = np.zeros_like(host_labels)
+            vac_map: dict[int, int] = {}
+        else:
+            masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
+            vac_labels, _, _ = segment_pvs(
+                image=masked,
+                channel_index=p.get("vac_seg_ch", 1),
+                use_composite=p.get("use_composite", False),
+                min_area_px=vac_min_px,
+                max_area_px=vac_max_px,
+                max_eccentricity=p.get("max_eccentricity", 0.85),
+                min_solidity=p.get("min_solidity", 0.70),
+                diameter=None,
+                flow_threshold=p.get("flow_threshold", 0.4),
+                cellprob_threshold=p.get("cellprob_threshold", 0.0),
+                threshold_method=p.get("threshold_method", "none"),
+                threshold_channel=p.get("threshold_channel", p.get("vac_seg_ch", 1)),
+                threshold_value=p.get("threshold_value", 0.0),
+                threshold_percentile=p.get("threshold_percentile", 50.0),
+            )
+            para_labels, vac_map = segment_parasites_in_vacuoles(
+                image=masked,
+                vac_labels=vac_labels,
+                seg_channel=p.get("seg_ch", 0),
+                model=None,
+                min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
+                if file_px > 0
+                else 0.0,
+                max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
+                if file_px > 0
+                else 1e9,
+                max_eccentricity=p.get("max_eccentricity", 0.85),
+                min_solidity=p.get("min_solidity", 0.70),
+            )
 
         # ── Stage H3: assign + measure ───────────────────────────────────────
-        para_to_host, vac_to_host, dropped = assign_to_hosts(
-            para_labels, host_labels, vac_map
-        )
-        if dropped:
-            self.progress.emit(
-                pos_idx,
-                total,
-                f"    {len(dropped)} parasite(s) without host majority dropped: "
-                f"{sorted(dropped)}",
+        if host_only:
+            para_to_host: dict[int, int] = {}
+            vac_to_host: dict[int, int] = {}
+        else:
+            para_to_host, vac_to_host, dropped = assign_to_hosts(
+                para_labels, host_labels, vac_map
             )
+            if dropped:
+                self.progress.emit(
+                    pos_idx,
+                    total,
+                    f"    {len(dropped)} parasite(s) without host majority "
+                    f"dropped: {sorted(dropped)}",
+                )
         hosts_df = measure_hosts(
             host_labels=host_labels,
             para_labels=para_labels,
@@ -811,16 +831,22 @@ class _BatchWorker(QObject):
             ch_names=ch_names,
             pixel_size_um=file_px if file_px > 0 else None,
         )
-        para_df = measure_pvs(
-            labels=para_labels,
-            image=image,
-            ch_cptsa=ch_cptsa,
-            ch_mcherry=ch_mcherry,
-            ch_names=ch_names,
-            pixel_size_um=file_px if file_px > 0 else None,
-        )
-        if not para_df.empty:
-            para_df["host_id"] = para_df.index.map(para_to_host)
+        if host_only:
+            # Parasites were never assessed — the infection columns would read
+            # as "verified uninfected", so they are dropped instead.
+            hosts_df = drop_infection_columns(hosts_df)
+            para_df = pd.DataFrame()
+        else:
+            para_df = measure_pvs(
+                labels=para_labels,
+                image=image,
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                ch_names=ch_names,
+                pixel_size_um=file_px if file_px > 0 else None,
+            )
+            if not para_df.empty:
+                para_df["host_id"] = para_df.index.map(para_to_host)
 
         # Experimental metadata (same tagging idea as PV mode)
         for df in (hosts_df, para_df):
@@ -831,21 +857,31 @@ class _BatchWorker(QObject):
                 df["cell_line"] = p["cell_line"]
                 df["replicate"] = p["replicate"]
 
-        n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
-        self.progress.emit(
-            pos_idx,
-            total,
-            f"    {len(hosts_df)} hosts ({n_inf} infected), {len(para_df)} parasites.",
-        )
+        if host_only:
+            self.progress.emit(
+                pos_idx,
+                total,
+                f"    {len(hosts_df)} hosts measured (host-only).",
+            )
+        else:
+            n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
+            self.progress.emit(
+                pos_idx,
+                total,
+                f"    {len(hosts_df)} hosts ({n_inf} infected), "
+                f"{len(para_df)} parasites.",
+            )
 
         # ── Persist masks; stash results + curation entry ────────────────────
         try:
             save_mask_tiff(
                 host_labels, mask_dir / f"{file_stem}_{safe_pos}_host_mask.tif"
             )
-            save_mask_tiff(
-                para_labels, mask_dir / f"{file_stem}_{safe_pos}_host_para_mask.tif"
-            )
+            if not host_only:
+                save_mask_tiff(
+                    para_labels,
+                    mask_dir / f"{file_stem}_{safe_pos}_host_para_mask.tif",
+                )
         except Exception as exc:
             self.progress.emit(pos_idx, total, f"    WARNING: mask save failed: {exc}")
 
@@ -854,6 +890,7 @@ class _BatchWorker(QObject):
         curation_list.append(
             {
                 "mode": "host",
+                "host_only": host_only,
                 "display_name": f"{file_stem} | {pos_name}",
                 "file": file_stem,
                 "position_name": pos_name,
@@ -872,6 +909,10 @@ class _BatchWorker(QObject):
 
 
 # ── Batch widget ──────────────────────────────────────────────────────────────
+
+# Combo-index → internal mode string for the Channels-tab "Analysis mode"
+# selector.  Order must match the addItems() call in _build_channels_tab.
+_ANALYSIS_MODES = ("pv", "host", "host_only")
 
 
 class BatchWidget(QWidget):
@@ -944,18 +985,6 @@ class BatchWidget(QWidget):
         layout = QVBoxLayout(w)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
-
-        mode_box = QGroupBox("Analysis mode")
-        mode_layout = QVBoxLayout(mode_box)
-        self._analysis_mode = QComboBox()
-        self._analysis_mode.addItems(["Vacuoles / PVs", "Host cells"])
-        self._analysis_mode.setToolTip(
-            "Vacuoles/PVs — existing two-stage PV pipeline.\n"
-            "Host cells — segment Peredox-expressing hosts, then parasites\n"
-            "inside them; outputs hosts.csv + host_parasites.csv."
-        )
-        mode_layout.addWidget(self._analysis_mode)
-        layout.insertWidget(0, mode_box)
 
         src_box = QGroupBox("Image source")
         src_layout = QVBoxLayout(src_box)
@@ -1034,19 +1063,44 @@ class BatchWidget(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
 
-        ch_box = QGroupBox("Channels & segmentation")
-        ch_form = QFormLayout(ch_box)
-        ch_form.setContentsMargins(6, 6, 6, 6)
+        # Analysis mode selector — governs which setting groups below are shown
+        mode_box = QGroupBox("Analysis mode")
+        mode_layout = QVBoxLayout(mode_box)
+        self._analysis_mode = QComboBox()
+        self._analysis_mode.addItems(
+            ["Parasites / PVs", "Host cells + parasites", "Host cells only"]
+        )
+        self._analysis_mode.setToolTip(
+            "Parasites / PVs — the original two-stage vacuole→parasite pipeline.\n"
+            "Host cells + parasites — segment Peredox-expressing hosts, then\n"
+            "parasites inside them (hosts.csv + host_parasites.csv).\n"
+            "Host cells only — segment and measure hosts, skip parasite\n"
+            "detection entirely (hosts.csv without infection columns)."
+        )
+        mode_layout.addWidget(self._analysis_mode)
+        layout.addWidget(mode_box)
+
+        # Ratio channels — needed by every analysis mode
+        ratio_box = QGroupBox("Ratio channels")
+        ratio_form = QFormLayout(ratio_box)
+        ratio_form.setContentsMargins(6, 6, 6, 6)
 
         self._ch_cptsa = QSpinBox()
         self._ch_cptsa.setRange(0, 15)
         self._ch_cptsa.setValue(0)
-        ch_form.addRow("cpTSapphire ch:", self._ch_cptsa)
+        ratio_form.addRow("cpTSapphire ch:", self._ch_cptsa)
 
         self._ch_mcherry = QSpinBox()
         self._ch_mcherry.setRange(0, 15)
         self._ch_mcherry.setValue(1)
-        ch_form.addRow("mCherry ch:", self._ch_mcherry)
+        ratio_form.addRow("mCherry ch:", self._ch_mcherry)
+
+        layout.addWidget(ratio_box)
+
+        # Parasite / vacuole segmentation — hidden in host-only mode
+        ch_box = QGroupBox("Parasite / vacuole segmentation")
+        ch_form = QFormLayout(ch_box)
+        ch_form.setContentsMargins(6, 6, 6, 6)
 
         self._seg_backend = QComboBox()
         self._seg_backend.addItems(["cpSAM (Cellpose)", "StarDist (fine-tuned)"])
@@ -1267,14 +1321,36 @@ class BatchWidget(QWidget):
         self._host_dilation_px.setValue(3)
         host_form.addRow("Parasite exclusion buffer (px):", self._host_dilation_px)
 
-        host_box.setEnabled(False)
-        self._analysis_mode.currentIndexChanged.connect(
-            lambda i: host_box.setEnabled(i == 1)
-        )
         layout.addWidget(host_box)
+
+        # Per-mode group visibility (the mode combo lives at the top of this tab)
+        self._pv_seg_box = ch_box
+        self._filt_box = filt_box
+        self._host_box = host_box
+        self._analysis_mode.currentIndexChanged.connect(
+            lambda _i: self._update_mode_visibility()
+        )
+        self._update_mode_visibility()
 
         layout.addStretch()
         return w
+
+    def _current_analysis_mode(self) -> str:
+        """Return 'pv', 'host', or 'host_only' from the Channels-tab selector."""
+        combo = getattr(self, "_analysis_mode", None)
+        if combo is None:
+            return "pv"
+        idx = combo.currentIndex()
+        if 0 <= idx < len(_ANALYSIS_MODES):
+            return _ANALYSIS_MODES[idx]
+        return "pv"
+
+    def _update_mode_visibility(self) -> None:
+        """Show only the Channels-tab groups relevant to the selected mode."""
+        mode = self._current_analysis_mode()
+        self._pv_seg_box.setVisible(mode != "host_only")
+        self._filt_box.setVisible(mode != "host_only")
+        self._host_box.setVisible(mode != "pv")
 
     # ── Output tab ────────────────────────────────────────────────────────────
 
@@ -1689,12 +1765,7 @@ class BatchWidget(QWidget):
             "threshold_percentile": self._thresh_percentile.value(),
             "seg_backend": self._seg_backend.currentIndex(),  # 0=cpSAM, 1=StarDist
             "annot_dir": self._annot_dir.text(),
-            "analysis_mode": (
-                "host"
-                if getattr(self, "_analysis_mode", None) is not None
-                and self._analysis_mode.currentIndex() == 1
-                else "pv"
-            ),
+            "analysis_mode": self._current_analysis_mode(),
             "host_ch": getattr(self, "_host_ch", None).value()
             if getattr(self, "_host_ch", None)
             else 1,
@@ -2267,8 +2338,9 @@ class BatchWidget(QWidget):
         from ._curation import VacuoleCurationWidget
 
         def _on_save(decisions: dict, curated_hosts: np.ndarray):
-            from ._host import assign_to_hosts, measure_hosts
+            from ._host import assign_to_hosts, drop_infection_columns, measure_hosts
 
+            host_only = bool(item.get("host_only"))
             hosts = curated_hosts.copy()
             for hid, dec in decisions.items():
                 if dec == 0:
@@ -2277,9 +2349,13 @@ class BatchWidget(QWidget):
 
             # Recompute assignment + measurement against the curated hosts.
             # Parasites in rejected hosts lose their majority and are dropped.
-            para_to_host, vac_to_host, _dropped = assign_to_hosts(
-                item["para_labels"], hosts, item.get("vac_map") or None
-            )
+            if host_only:
+                para_to_host: dict[int, int] = {}
+                vac_to_host: dict[int, int] = {}
+            else:
+                para_to_host, vac_to_host, _dropped = assign_to_hosts(
+                    item["para_labels"], hosts, item.get("vac_map") or None
+                )
             ch_names = {0: "ch0", 1: "ch1"}
             ch_names[self._ch_cptsa.value()] = "cptsa"
             ch_names[self._ch_mcherry.value()] = "mcherry"
@@ -2296,19 +2372,23 @@ class BatchWidget(QWidget):
                 ch_names=ch_names,
                 pixel_size_um=file_px if file_px > 0 else None,
             )
-            from ._measure import measure_pvs
+            if host_only:
+                hosts_df = drop_infection_columns(hosts_df)
+                para_df = pd.DataFrame()
+            else:
+                from ._measure import measure_pvs
 
-            para_df = measure_pvs(
-                labels=item["para_labels"],
-                image=item["image"],
-                ch_cptsa=self._ch_cptsa.value(),
-                ch_mcherry=self._ch_mcherry.value(),
-                ch_names=ch_names,
-                pixel_size_um=file_px if file_px > 0 else None,
-            )
-            if not para_df.empty:
-                para_df["host_id"] = para_df.index.map(para_to_host)
-                para_df = para_df[para_df["host_id"].notna()]
+                para_df = measure_pvs(
+                    labels=item["para_labels"],
+                    image=item["image"],
+                    ch_cptsa=self._ch_cptsa.value(),
+                    ch_mcherry=self._ch_mcherry.value(),
+                    ch_names=ch_names,
+                    pixel_size_um=file_px if file_px > 0 else None,
+                )
+                if not para_df.empty:
+                    para_df["host_id"] = para_df.index.map(para_to_host)
+                    para_df = para_df[para_df["host_id"].notna()]
             for df in (hosts_df, para_df):
                 if df is not None and not df.empty:
                     df["file"] = item["file"]
@@ -2395,8 +2475,7 @@ class BatchWidget(QWidget):
 
     def _load_host_classifier_if_requested(self):
         """Host classifier for batch host mode; None when unavailable/not requested."""
-        mode_combo = getattr(self, "_analysis_mode", None)
-        if mode_combo is None or mode_combo.currentIndex() != 1:
+        if self._current_analysis_mode() == "pv":
             return None
         if not self._use_classifier.isChecked():
             return None

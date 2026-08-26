@@ -28,6 +28,23 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# Columns in measure_hosts() output that only make sense when parasites were
+# actually assessed.  Host-only analysis (no parasite stage) drops these from
+# its exported tables so a reader can never mistake "never checked" for
+# "verified uninfected".
+INFECTION_COLS = [
+    "infected",
+    "n_parasites",
+    "n_vacuoles",
+    "parasite_area_px",
+    "cytosol_empty",
+]
+
+
+def drop_infection_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* without the parasite-assessment columns."""
+    return df.drop(columns=[c for c in INFECTION_COLS if c in df.columns])
+
 
 def clip_bright(channel: np.ndarray, percentile: float = 99.0) -> np.ndarray:
     """

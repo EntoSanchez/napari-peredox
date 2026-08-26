@@ -1584,6 +1584,14 @@ class PeredoxWidget(QWidget):
         self._host_use_classifier = QCheckBox("Apply host classifier filter")
         par_form.addRow("", self._host_use_classifier)
 
+        self._host_only = QCheckBox("Host cells only (skip parasite detection)")
+        self._host_only.setToolTip(
+            "Measure host cells without ever looking for parasites\n"
+            "(e.g. uninfected control dishes). Stage H2 is skipped and the\n"
+            "infection columns are omitted from the exported CSV."
+        )
+        par_form.addRow("", self._host_only)
+
         layout.addWidget(par_box)
 
         # Stage H1
@@ -1602,8 +1610,9 @@ class PeredoxWidget(QWidget):
         h1_layout.addWidget(self._btn_host_review)
         layout.addWidget(h1_box)
 
-        # Stage H2
-        h2_box = QGroupBox("Stage H2 — Parasites in hosts")
+        # Stage H2 (hidden entirely when "Host cells only" is checked)
+        self._host_h2_box = QGroupBox("Stage H2 — Parasites in hosts")
+        h2_box = self._host_h2_box
         h2_layout = QVBoxLayout(h2_box)
         self._btn_host_stage2 = QPushButton("▶ Segment parasites in hosts")
         self._btn_host_stage2.setStyleSheet("font-weight: bold;")
@@ -1635,6 +1644,20 @@ class PeredoxWidget(QWidget):
         self._btn_host_export.setEnabled(False)
         h3_layout.addWidget(self._btn_host_export)
         layout.addWidget(h3_box)
+
+        def _on_host_only_toggled(checked: bool) -> None:
+            self._host_h2_box.setVisible(not checked)
+            if checked:
+                ready = self._host_labels is not None and self._host_review_saved
+                self._btn_host_measure.setEnabled(ready)
+                if ready:
+                    self._lbl_host_measure.setText("Host-only mode — ready to measure.")
+            else:
+                self._btn_host_measure.setEnabled(self._host_para_labels is not None)
+                if self._host_para_labels is None:
+                    self._lbl_host_measure.setText("Complete Stages H1–H2 first.")
+
+        self._host_only.toggled.connect(_on_host_only_toggled)
 
         layout.addStretch()
         return w
@@ -1858,9 +1881,7 @@ class PeredoxWidget(QWidget):
             f"Curation done — {n_remaining} accepted hosts ready for Stage H2."
         )
         self._host_review_saved = True
-        self._btn_host_stage2.setEnabled(n_remaining > 0)
-        if n_remaining > 0:
-            self._lbl_host_stage2.setText("Ready — click to detect parasites.")
+
         # Invalidate any parasites detected against the pre-curation hosts
         self._host_para_labels = None
         self._btn_host_review_para.setEnabled(False)
@@ -1868,6 +1889,17 @@ class PeredoxWidget(QWidget):
         self._host_measurements = None
         self._host_para_measurements = None
         self._btn_host_export.setEnabled(False)
+
+        if self._host_only.isChecked():
+            # Host-only mode: Stage H2 is skipped — go straight to measurement.
+            self._btn_host_stage2.setEnabled(False)
+            self._btn_host_measure.setEnabled(n_remaining > 0)
+            if n_remaining > 0:
+                self._lbl_host_measure.setText("Host-only mode — ready to measure.")
+        else:
+            self._btn_host_stage2.setEnabled(n_remaining > 0)
+            if n_remaining > 0:
+                self._lbl_host_stage2.setText("Ready — click to detect parasites.")
 
     # ── Placeholders completed in Tasks 10–11 ────────────────────────────────
 
@@ -2064,7 +2096,15 @@ class PeredoxWidget(QWidget):
         if self._host_labels is None:
             self._log_msg("Run Stage H1 first.")
             return
-        if self._host_para_labels is None:
+        host_only = self._host_only.isChecked()
+        if host_only:
+            # Host-only mode: parasites are never looked for; any Stage-H2
+            # results from before the checkbox was ticked are discarded.
+            self._host_para_labels = np.zeros_like(self._host_labels)
+            self._host_vac_map = {}
+            self._host_para_measurements = None
+            self._log_msg("Host-only mode — parasite detection skipped.")
+        elif self._host_para_labels is None:
             # Zero parasites is valid — an uninfected control image (spec §7)
             self._host_para_labels = np.zeros_like(self._host_labels)
             self._host_vac_map = {}
@@ -2081,18 +2121,22 @@ class PeredoxWidget(QWidget):
         ch_names[self._ch_mcherry.value()] = "mcherry"
         px = self._pixel_size.value()
 
-        from ._host import assign_to_hosts, measure_hosts
+        from ._host import assign_to_hosts, drop_infection_columns, measure_hosts
 
-        para_to_host, vac_to_host, dropped = assign_to_hosts(
-            self._host_para_labels,
-            self._host_labels,
-            self._host_vac_map if self._host_vac_map else None,
-        )
-        if dropped:
-            self._log_msg(
-                f"{len(dropped)} parasite(s) had no host majority and were "
-                f"dropped from host statistics: labels {sorted(dropped)}"
+        if host_only:
+            para_to_host: dict[int, int] = {}
+            vac_to_host: dict[int, int] = {}
+        else:
+            para_to_host, vac_to_host, dropped = assign_to_hosts(
+                self._host_para_labels,
+                self._host_labels,
+                self._host_vac_map if self._host_vac_map else None,
             )
+            if dropped:
+                self._log_msg(
+                    f"{len(dropped)} parasite(s) had no host majority and were "
+                    f"dropped from host statistics: labels {sorted(dropped)}"
+                )
 
         hosts_df = measure_hosts(
             host_labels=self._host_labels,
@@ -2106,11 +2150,16 @@ class PeredoxWidget(QWidget):
             ch_names=ch_names,
             pixel_size_um=px if px > 0 else None,
         )
+        if host_only:
+            # Parasites were never assessed — the infection columns would read
+            # as "verified uninfected", so they are dropped instead.
+            hosts_df = drop_infection_columns(hosts_df)
         self._host_measurements = hosts_df
 
         # Tag each parasite row with its host
         if (
-            self._host_para_measurements is not None
+            not host_only
+            and self._host_para_measurements is not None
             and not self._host_para_measurements.empty
         ):
             self._host_para_measurements = self._host_para_measurements.copy()
@@ -2123,12 +2172,18 @@ class PeredoxWidget(QWidget):
                 self._host_para_measurements["host_id"].notna()
             ]
 
-        n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
         n_tot = len(hosts_df)
-        n_empty = int(hosts_df["cytosol_empty"].sum()) if not hosts_df.empty else 0
-        msg = f"{n_tot} hosts measured — {n_inf} infected, {n_tot - n_inf} uninfected."
-        if n_empty:
-            msg += f" {n_empty} host(s) fully covered by parasites (NaN ratio)."
+        if host_only:
+            msg = f"{n_tot} hosts measured (host-only — infection not assessed)."
+        else:
+            n_inf = int(hosts_df["infected"].sum()) if not hosts_df.empty else 0
+            n_empty = int(hosts_df["cytosol_empty"].sum()) if not hosts_df.empty else 0
+            msg = (
+                f"{n_tot} hosts measured — {n_inf} infected, "
+                f"{n_tot - n_inf} uninfected."
+            )
+            if n_empty:
+                msg += f" {n_empty} host(s) fully covered by parasites (NaN ratio)."
         self._lbl_host_measure.setText(msg)
         self._log_msg(f"Stage H3 done: {msg}")
         self._btn_host_export.setEnabled(True)

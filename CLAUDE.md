@@ -75,6 +75,9 @@ _host.py     ← Host-cell segmentation and infection analysis (see "Host analys
                measure_hosts()            per-host cytosol (host minus dilated
                                            parasites) Peredox ratio + infection
                                            metadata columns (Stage H3)
+               drop_infection_columns()   strip INFECTION_COLS from a hosts
+                                           table — used by host-only mode so
+                                           "never checked" ≠ "uninfected"
 
 _io.py       ← Persistence
                save_measurements()        → annotations/results/<stem>_measurements.csv
@@ -153,17 +156,42 @@ Stages run in order, each gated behind the previous one's save/completion:
    `_export_host_csv`). Builds the results table and writes the CSV/TIFF
    outputs below.
 
+**Host-only checkbox.** The Host tab's settings group has a
+"Host cells only (skip parasite detection)" checkbox for images where
+parasites should never be looked for (e.g. uninfected control dishes).
+Checking it hides the Stage H2 group, lets saving the host review enable
+Measure directly, and exports the host CSV **without** the
+parasite-assessment columns (`_host.INFECTION_COLS`: `infected`,
+`n_parasites`, `n_vacuoles`, `parasite_area_px`, `cytosol_empty`) — so
+"never checked" can't be mistaken for "verified uninfected". No parasite
+CSV/TIF is written in this mode.
+
 ### Batch mode (`_batch.py`)
 
-`BatchWidget` has an **Analysis mode** dropdown: "Vacuoles / PVs" (existing
-behavior, default) or "Host cells". In host mode, `_BatchWorker._process_host_position()`
-runs H1 → H2 → H3 automatically for every position; the host classifier (when
-trained) filters Stage H1 only — Stage H2 parasite detection in batch host
-mode is not classifier-filtered. Host-mask review happens per position via
-the same curation gallery used for PV batch review. Output
-folder gets `hosts.csv` and `host_parasites.csv` (one row per host / per
-parasite across all positions), plus per-position `*_host_mask.tif` /
-`*_host_para_mask.tif` label images alongside the existing PV batch outputs.
+`BatchWidget` has a three-way **Analysis mode** selector at the top of the
+**Channels tab** (`_current_analysis_mode()` → `"pv"` / `"host"` /
+`"host_only"`); only the settings groups relevant to the selected mode are
+shown (`_update_mode_visibility()`):
+
+| Channels-tab group | Parasites / PVs | Host cells + parasites | Host cells only |
+|---|---|---|---|
+| Ratio channels (cpTSapphire, mCherry) | shown | shown | shown |
+| Parasite / vacuole segmentation | shown | shown | hidden |
+| Morphology filters | shown | shown | hidden |
+| Host mode settings | hidden | shown | shown |
+
+In both host modes, `_BatchWorker._process_host_position()` runs
+automatically for every position; the host classifier (when trained)
+filters Stage H1 only — Stage H2 parasite detection in batch host mode is
+not classifier-filtered. Host-mask review happens per position via the same
+curation gallery used for PV batch review. "Host cells + parasites" runs
+H1 → H2 → H3 and writes `hosts.csv` and `host_parasites.csv` (one row per
+host / per parasite across all positions), plus per-position
+`*_host_mask.tif` / `*_host_para_mask.tif` label images alongside the
+existing PV batch outputs. "Host cells only" skips Stage H2 entirely: it
+writes `hosts.csv` **without** the parasite-assessment columns (same
+`INFECTION_COLS` semantics as the single-image checkbox), no
+`host_parasites.csv`, and no `*_host_para_mask.tif`.
 
 ### Population rule (spec §2)
 
@@ -219,7 +247,7 @@ verified by running it on real images (spec §8 acceptance test).
 uv run pytest tests/ -v
 ```
 
-32 tests, all passing as of 2026-08-25.
+36 tests, all passing as of 2026-08-26.
 
 ---
 
@@ -267,7 +295,7 @@ uv run pytest tests/ -v
 - **Imports verified**: all modules import cleanly from the venv, including `_host` (`_widget`, `_batch`, `_curation`, `_host`)
 - **Host-cell analysis mode added** (`host-analysis` branch, spec
   `docs/superpowers/specs/2026-08-25-host-analysis-design.md`): see "Host
-  analysis workflow" above. `tests/` added (pytest, 32 tests passing).
+  analysis workflow" above. `tests/` added (pytest; 36 tests passing as of the three-mode update).
   Not yet run against real U2OS Peredox images end-to-end (spec §8
   acceptance test — cpSAM segmentation quality on real data — is pending
   manual verification).
