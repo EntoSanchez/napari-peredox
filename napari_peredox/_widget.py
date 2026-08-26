@@ -1572,15 +1572,21 @@ class PeredoxWidget(QWidget):
 
         self._host_diameter = QSpinBox()
         self._host_diameter.setRange(0, 2000)
-        self._host_diameter.setValue(0)
+        self._host_diameter.setValue(300)
         self._host_diameter.setSpecialValueText("auto")
-        self._host_diameter.setToolTip("Expected host-cell diameter in px (0 = auto).")
+        self._host_diameter.setToolTip(
+            "Expected host-cell diameter in px (default 300 ≈ 32 µm at 60×).\n"
+            "0 = auto — NOT recommended: on dim Peredox images auto-estimation\n"
+            "shatters cells into speckle."
+        )
         par_form.addRow("Diameter (px):", self._host_diameter)
 
         self._host_min_area_um2 = QDoubleSpinBox()
         self._host_min_area_um2.setRange(0.0, 1e6)
         self._host_min_area_um2.setDecimals(0)
-        self._host_min_area_um2.setValue(200.0)
+        # 350 µm² sits above a U2OS nucleus (~150-250 µm²) so nucleus-scale
+        # junk is rejected while whole cells (~600-900 µm²) pass.
+        self._host_min_area_um2.setValue(350.0)
         self._host_max_area_um2 = QDoubleSpinBox()
         self._host_max_area_um2.setRange(0.0, 1e6)
         self._host_max_area_um2.setDecimals(0)

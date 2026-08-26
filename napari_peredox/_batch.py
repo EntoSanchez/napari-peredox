@@ -1311,18 +1311,22 @@ class BatchWidget(QWidget):
 
         self._host_diameter = QSpinBox()
         self._host_diameter.setRange(0, 2000)
-        self._host_diameter.setValue(0)
+        self._host_diameter.setValue(300)
         self._host_diameter.setSpecialValueText("auto")
         self._host_diameter.setToolTip(
-            "Expected host-cell diameter in px (0 = auto). Independent of the\n"
-            "parasite/vacuole diameter above, which is hidden in host-only mode."
+            "Expected host-cell diameter in px (default 300 ≈ 32 µm at 60×).\n"
+            "0 = auto — NOT recommended: on dim Peredox images auto-estimation\n"
+            "shatters cells into speckle. Independent of the parasite/vacuole\n"
+            "diameter above, which is hidden in host-only mode."
         )
         host_form.addRow("Host diameter (px):", self._host_diameter)
 
         self._host_min_area_um2 = QDoubleSpinBox()
         self._host_min_area_um2.setRange(0.0, 1e6)
         self._host_min_area_um2.setDecimals(0)
-        self._host_min_area_um2.setValue(200.0)
+        # 350 µm² sits above a U2OS nucleus (~150-250 µm²) so nucleus-scale
+        # junk is rejected while whole cells (~600-900 µm²) pass.
+        self._host_min_area_um2.setValue(350.0)
         self._host_max_area_um2 = QDoubleSpinBox()
         self._host_max_area_um2.setRange(0.0, 1e6)
         self._host_max_area_um2.setDecimals(0)
@@ -1832,7 +1836,7 @@ class BatchWidget(QWidget):
             else 99.0,
             "host_min_area_um2": getattr(self, "_host_min_area_um2", None).value()
             if getattr(self, "_host_min_area_um2", None)
-            else 200.0,
+            else 350.0,
             "host_max_area_um2": getattr(self, "_host_max_area_um2", None).value()
             if getattr(self, "_host_max_area_um2", None)
             else 10000.0,

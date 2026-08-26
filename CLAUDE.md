@@ -133,7 +133,10 @@ Stages run in order, each gated behind the previous one's save/completion:
 1. **Stage H1 — segment host cells** (`_run_host_stage1` → `_host.segment_host_cells()`
    on a dedicated `_HostWorker` / `_host_thread`, never the PV worker/thread).
    Host-tab widgets: host channel (default mCherry), clip percentile
-   (default 99.0), cpSAM diameter, host area gates (µm²), and the parasite
+   (default 99.0), cpSAM diameter (default 300 px — never leave on auto:
+   on dim Peredox images auto-estimation shatters cells into speckle; see
+   scripts/NOTES.md), host area gates (µm², default 350–10000: min sits
+   above a U2OS nucleus so nucleus-scale junk is rejected), and the parasite
    exclusion buffer (px). Flow/cellprob thresholds are not duplicated in the
    Host tab — Stage H1 reuses the Setup tab's shared cpSAM `flow_threshold` /
    `cellprob_threshold` spinboxes.
