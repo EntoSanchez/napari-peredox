@@ -1051,6 +1051,26 @@ class PeredoxWidget(QWidget):
         else:
             self._clf_status.setText("No classifier trained yet.")
 
+    def _update_host_clf_status(self) -> None:
+        """Refresh the Host tab's status line for the separate host classifier."""
+        from ._learning import classifier_stats
+
+        annot_dir = Path(self._annot_dir.text())
+        stats = classifier_stats(annot_dir / "curated_host_features.csv")
+        model_exists = (annot_dir / "curated_host_features.joblib").exists()
+        if model_exists:
+            self._host_clf_status.setText(
+                f"Host classifier trained — {stats['total']} examples "
+                f"({stats['accepted']} accepted, {stats['rejected']} rejected)."
+            )
+        elif stats["total"] > 0:
+            self._host_clf_status.setText(
+                f"{stats['total']} host annotations on disk — classifier needs "
+                f"≥10 examples with both classes."
+            )
+        else:
+            self._host_clf_status.setText("No host classifier trained yet.")
+
     # ── Stage 1: vacuole detection ───────────────────────────────────────────
 
     def _run_stage1(self) -> None:
@@ -1592,6 +1612,15 @@ class PeredoxWidget(QWidget):
         )
         par_form.addRow("", self._host_only)
 
+        self._host_clf_status = QLabel("No host classifier trained yet.")
+        self._host_clf_status.setWordWrap(True)
+        self._host_clf_status.setToolTip(
+            "The host classifier is separate from the PV classifier — it is\n"
+            "trained from curated_host_features.csv, grown each time a host\n"
+            "review is saved (here or in batch host mode)."
+        )
+        par_form.addRow("", self._host_clf_status)
+
         layout.addWidget(par_box)
 
         # Stage H1
@@ -1678,6 +1707,8 @@ class PeredoxWidget(QWidget):
                     )
 
         self._host_only.toggled.connect(_on_host_only_toggled)
+
+        self._update_host_clf_status()
 
         layout.addStretch()
         return w
@@ -1903,6 +1934,7 @@ class PeredoxWidget(QWidget):
                 self._log_msg("Not enough host data to train the classifier yet.")
         except Exception as exc:
             self._log_msg(f"Host annotation save error: {exc}")
+        self._update_host_clf_status()
 
         # Drop rejected hosts from the working label image
         rejected = {hid for hid, dec in decisions.items() if dec == 0}

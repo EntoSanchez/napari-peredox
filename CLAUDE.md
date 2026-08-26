@@ -184,7 +184,13 @@ In both host modes, `_BatchWorker._process_host_position()` runs
 automatically for every position; the host classifier (when trained)
 filters Stage H1 only — Stage H2 parasite detection in batch host mode is
 not classifier-filtered. Host-mask review happens per position via the same
-curation gallery used for PV batch review. "Host cells + parasites" runs
+curation gallery used for PV batch review, and saving a host review appends
+to the same `curated_host_features.csv` / retrains the same host classifier
+as the single-image Host tab. The Output tab's classifier status label is
+mode-aware: it describes the PV classifier in PV mode and the host
+classifier in host modes (both share the one "Apply classifier filter"
+checkbox). The single-image Host tab shows its own host-classifier status
+line. "Host cells + parasites" runs
 H1 → H2 → H3 and writes `hosts.csv` and `host_parasites.csv` (one row per
 host / per parasite across all positions), plus per-position
 `*_host_mask.tif` / `*_host_para_mask.tif` label images alongside the

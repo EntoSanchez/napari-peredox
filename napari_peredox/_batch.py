@@ -1363,6 +1363,11 @@ class BatchWidget(QWidget):
         self._pv_seg_box.setVisible(mode != "host_only")
         self._filt_box.setVisible(mode != "host_only")
         self._host_box.setVisible(mode != "pv")
+        # Refresh the classifier label to describe the mode's classifier.
+        # Guarded: the first call fires during _build_channels_tab, before the
+        # Output tab (which owns _clf_label) has been built.
+        if getattr(self, "_clf_label", None) is not None:
+            self._try_load_classifier()
 
     # ── Output tab ────────────────────────────────────────────────────────────
 
@@ -1580,6 +1585,28 @@ class BatchWidget(QWidget):
         annot_dir = self._annot_dir.text()
         clf = load_classifier(annot_dir)
         self._classifier = clf
+
+        # The status label describes whichever classifier the selected
+        # analysis mode will actually apply: PV classifier in PV mode, the
+        # separate host classifier (curated_host_features.*) in host modes.
+        if self._current_analysis_mode() != "pv":
+            host_clf = load_classifier(
+                annot_dir, filename="curated_host_features.joblib"
+            )
+            stats = classifier_stats(Path(annot_dir) / "curated_host_features.csv")
+            if host_clf is not None:
+                self._clf_label.setText(
+                    f"Host classifier loaded — {stats['total']} annotations "
+                    f"({stats['accepted']} accept / {stats['rejected']} reject). "
+                    f"Stage H1 false-positive filtering is active."
+                )
+            else:
+                self._clf_label.setText(
+                    "No host classifier yet. Review host cells here or in the "
+                    "single-image Host tab to build its training data "
+                    "(curated_host_features.csv, separate from the PV classifier)."
+                )
+            return
 
         csv_path = Path(annot_dir) / "curated_features.csv"
         stats = classifier_stats(csv_path)
@@ -2437,6 +2464,43 @@ class BatchWidget(QWidget):
                 f"Host review saved for {item['display_name']} — "
                 f"{len(hosts_df)} hosts kept."
             )
+
+            # Grow the host classifier's training set from this review — the
+            # same curated_host_features.* files the single-image Host tab
+            # feeds, kept fully separate from the PV classifier.  Features
+            # come from the pre-rejection array so rejected hosts contribute
+            # negative examples.
+            try:
+                from ._io import append_curated_annotations
+                from ._learning import extract_features, train_classifier
+
+                feats = extract_features(
+                    labels=curated_hosts,
+                    image=item["image"],
+                    seg_channel=self._host_ch.value(),
+                    ch_cptsa=self._ch_cptsa.value(),
+                    ch_mcherry=self._ch_mcherry.value(),
+                    ch_names=ch_names,
+                )
+                host_stem = (
+                    f"{item['file']}_{_safe_filename(item['position_name'])}_host"
+                )
+                csv_path = append_curated_annotations(
+                    decisions=decisions,
+                    features=feats,
+                    image_stem=host_stem,
+                    annotations_dir=self._annot_dir.text(),
+                    csv_name="curated_host_features.csv",
+                )
+                n_dec = sum(1 for v in decisions.values() if v in (0, 1))
+                self._log_msg(f"Saved {n_dec} host annotations → {csv_path}")
+                if train_classifier(csv_path) is not None:
+                    self._log_msg("Host classifier retrained.")
+                else:
+                    self._log_msg("Not enough host data to train the classifier yet.")
+                self._try_load_classifier()
+            except Exception as exc:
+                self._log_msg(f"Host annotation save error: {exc}")
 
         self._host_curation_win = VacuoleCurationWidget(
             vac_labels=item["host_labels"],
