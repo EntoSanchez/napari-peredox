@@ -70,7 +70,31 @@ def main() -> None:
     ap.add_argument("--treatment", default="")
     ap.add_argument("--cell-line", default="")
     ap.add_argument("--replicate", type=int, default=1)
+    ap.add_argument(
+        "--curated-from",
+        default=None,
+        help=(
+            "hosts.csv from the original run; only its (position, host_id) "
+            "pairs are kept. Saved masks are written BEFORE curation, so "
+            "without this a re-measure silently re-includes hosts that were "
+            "rejected during review."
+        ),
+    )
     args = ap.parse_args()
+
+    curated: dict[str, set[int]] | None = None
+    if args.curated_from:
+        cur = pd.read_csv(args.curated_from)
+        if not {"position", "host_id"}.issubset(cur.columns):
+            raise SystemExit("--curated-from needs 'position' and 'host_id' columns")
+        curated = {
+            str(pos): set(int(h) for h in grp["host_id"])
+            for pos, grp in cur.groupby("position")
+        }
+        print(
+            f"curation filter: {len(cur)} accepted hosts across "
+            f"{len(curated)} position(s)"
+        )
 
     run = Path(args.run_folder)
     mask_dir = run / "output" / "masks"
@@ -82,6 +106,7 @@ def main() -> None:
     ch_names = {args.cptsa: "cptsa", args.mcherry: "mcherry"}
     host_rows, para_rows, vac_rows = [], [], []
     n_fallback = 0
+    n_removed = 0
 
     host_masks = sorted(mask_dir.glob("*_host_mask.tif"))
     print(f"{run.name}: {len(host_masks)} position(s) with saved masks")
@@ -106,6 +131,18 @@ def main() -> None:
         host_labels, vac_labels, para_labels, vac_map = cached
         if not (mask_dir / f"{half}_{half}_host_vac_mask.tif").exists():
             n_fallback += 1
+
+        if curated is not None:
+            # Masks are saved pre-curation; drop hosts the review rejected so
+            # the re-measure reproduces the accepted population exactly.
+            keep = curated.get(half, set())
+            present = {int(v) for v in np.unique(host_labels) if v != 0}
+            for hid in present - keep:
+                host_labels[host_labels == hid] = 0
+            n_removed += len(present - keep)
+            if host_labels.max() == 0:
+                print(f"  {half[-28:]:28s} all hosts rejected in curation - skipped")
+                continue
 
         image = load_image(img_path)
         px = read_pixel_size(img_path)
@@ -214,6 +251,8 @@ def main() -> None:
         paras_all = pd.concat(para_rows)
         p = write_csv(paras_all, "host_parasites.csv")
         print(f"wrote {len(paras_all)} parasite rows -> {p.name}")
+    if n_removed:
+        print(f"curation filter removed {n_removed} host(s) rejected during review")
     if n_fallback:
         print(
             f"NOTE: {n_fallback} position(s) had no saved vacuole mask - their "
