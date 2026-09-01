@@ -60,6 +60,17 @@ def main() -> None:
     ap.add_argument("--max-eccentricity", type=float, default=0.95)
     ap.add_argument("--min-solidity", type=float, default=0.60)
     ap.add_argument("--force", action="store_true", help="redo existing masks")
+    ap.add_argument(
+        "--from-parasites",
+        action="store_true",
+        help=(
+            "Build vacuoles by grouping the existing parasite masks (dilate, "
+            "connected components, fill holes) instead of running cpSAM. Use "
+            "when Stage-1 detection latches onto host nuclei rather than PVs, "
+            "which is what happens on U2OS+Peredox mCherry images. No GPU."
+        ),
+    )
+    ap.add_argument("--dilation-px", type=int, default=5)
     args = ap.parse_args()
 
     run = Path(args.run_folder)
@@ -82,6 +93,50 @@ def main() -> None:
     )
     if not todo:
         return
+
+    if args.from_parasites:
+        from scipy.ndimage import binary_fill_holes
+        from skimage.measure import label as sk_label
+        from skimage.morphology import dilation as morph_dilation
+        from skimage.morphology import disk
+
+        for i, (hm, stem, out) in enumerate(todo, 1):
+            para_p = mask_dir / f"{stem}_host_para_mask.tif"
+            if not para_p.exists():
+                print(
+                    f"  [{i}/{len(todo)}] no parasite mask for {stem[-26:]} - skipped"
+                )
+                continue
+            para = tifffile.imread(para_p).astype(np.int32)
+            if para.max() == 0:
+                save_mask_tiff(np.zeros_like(para), out)
+                print(f"  [{i}/{len(todo)}] {stem[-26:]:26s} no parasites - empty mask")
+                continue
+            # Parasites sharing a vacuole are adjacent: dilate, take connected
+            # components, fill holes.  Same idea as _segment.group_by_vacuole()
+            # and _io._build_vacuole_mask(), which PV mode already relies on.
+            selem = disk(args.dilation_px)
+            grown = morph_dilation(para > 0, selem)
+            groups = sk_label(binary_fill_holes(grown), connectivity=2)
+            vac = np.zeros_like(para)
+            n = 0
+            for gid in np.unique(groups):
+                if gid == 0:
+                    continue
+                region = groups == gid
+                if not (para[region] > 0).any():
+                    continue  # dilation artefact with no parasite inside
+                n += 1
+                vac[region] = n
+            save_mask_tiff(vac, out)
+            print(
+                f"  [{i}/{len(todo)}] {stem[-26:]:26s} "
+                f"{len(np.unique(para)) - 1:2d} parasites -> {n:2d} vacuoles",
+                flush=True,
+            )
+        print("done (no GPU used)")
+        return
+
     print(preload_model())
 
     t_start = time.time()

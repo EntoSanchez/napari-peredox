@@ -60,9 +60,39 @@ Peredox/mCherry. Old files preserved in each `output/old_versions/`.
 | Vehicle | 237 | 19 | 1.3475 | 1.2853 | p = 0.073 |
 | 1_nM | 185 | 22 | 1.3084 | 1.3175 | p = 0.897 |
 
-**Vacuole caveat:** both runs predate vacuole-mask saving, so the per-vacuole
-columns fall back to the parasite mask — `n_vacuoles` equals `n_parasites` for
-100 % of infected hosts, and `mean_vacuole_ratio_intden` describes parasite
-bodies rather than PV lumens. True vacuole counts/lumen ratios need one fresh
-segmentation pass (which now saves `*_host_vac_mask.tif`, making every later
-re-measure faithful).
+**Vacuole masks (2026-09-01, second pass).** Both runs predated vacuole-mask
+saving. Two approaches were tried:
+
+1. `backfill_vacuole_masks.py` (cpSAM Stage-1 on host-masked mCherry, the
+   batch worker's own call) — **rejected**. QC showed only 51-62 % of
+   parasites landed inside a detected vacuole and 62-66 % of "vacuoles" were
+   empty; the overlay showed cpSAM had latched onto **host nuclei**, which are
+   the roundest high-contrast objects once the image is masked to hosts. The
+   20 um^2 Stage-1 floor also sits above a single PV (~12 um^2 here).
+2. `backfill_vacuole_masks.py --from-parasites` — **used**. Vacuoles are the
+   connected components of the parasite masks dilated 5 px and hole-filled
+   (`_segment.group_by_vacuole` / `_io._build_vacuole_mask` logic, which PV
+   mode already relies on). QC: 100 % of parasites inside a vacuole, zero
+   empty vacuoles, 1-5 parasites per vacuole. The mask is a tight envelope
+   around the parasite rosette, so `mean_vacuole_ratio_intden` is a
+   rosette-plus-margin ratio, not a full-lumen ratio.
+
+`check_vacuole_masks.py` runs that QC; always run it after a backfill.
+
+### Final numbers (curation-preserving re-measure, ch2/ch1)
+
+| Arm | Hosts | Infected | Vacuoles | Parasites | Uninf. median | Inf. median | Mann-Whitney |
+|---|---|---|---|---|---|---|---|
+| Vehicle | 229 | 18 | 25 | 46 | 1.3480 | 1.2868 | p = 0.046 |
+| 1_nM | 180 | 22 | 37 | 53 | 1.3051 | 1.3171 | p = 0.775 |
+
+Row counts match the original curated CSVs exactly (229 / 180) because
+`--curated-from` restored the review decisions the saved masks had lost.
+`n_vacuoles` now differs from `n_parasites` for 52 % of infected hosts (it was
+identical for 100 % under the parasite-mask fallback).
+
+**Open issue:** the QC overlay
+(`scripts/` render, 2026-09-01) shows bright PV rosettes in some cells with no
+parasite mask on them. Either those cells were not accepted as hosts (correct
+by the population rule) or Stage-2 missed them. Worth checking before treating
+the infection rate (~8-12 % of hosts) as final.
