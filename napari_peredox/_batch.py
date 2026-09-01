@@ -756,6 +756,7 @@ class _BatchWorker(QObject):
         """
         from ._host import (
             assign_to_hosts,
+            assign_vacuoles_to_hosts,
             drop_infection_columns,
             host_vacuole_summary,
             measure_hosts,
@@ -929,6 +930,14 @@ class _BatchWorker(QObject):
             para_to_host, vac_to_host, dropped = assign_to_hosts(
                 para_labels, host_labels, vac_map
             )
+            # Count vacuoles from the vacuole mask itself: assign_to_hosts()
+            # only sees vacuoles through their member parasites, so a vacuole
+            # whose parasites were never resolved would go uncounted.
+            if vac_labels is not None and np.asarray(vac_labels).max() > 0:
+                vac_direct, _vac_dropped = assign_vacuoles_to_hosts(
+                    vac_labels, host_labels
+                )
+                vac_to_host = {{**vac_to_host, **vac_direct}}
             if dropped:
                 self.progress.emit(
                     pos_idx,
@@ -2575,6 +2584,7 @@ class BatchWidget(QWidget):
         def _on_save(decisions: dict, curated_hosts: np.ndarray):
             from ._host import (
                 assign_to_hosts,
+                assign_vacuoles_to_hosts,
                 drop_infection_columns,
                 host_vacuole_summary,
                 measure_hosts,
@@ -2597,6 +2607,11 @@ class BatchWidget(QWidget):
                 para_to_host, vac_to_host, _dropped = assign_to_hosts(
                     item["para_labels"], hosts, item.get("vac_map") or None
                 )
+                _vl = item.get("vac_labels")
+                if _vl is not None and np.asarray(_vl).max() > 0:
+                    # Vacuole count comes from the mask, not from parasites.
+                    vac_direct, _ = assign_vacuoles_to_hosts(_vl, hosts)
+                    vac_to_host = {**vac_to_host, **vac_direct}
             # Channels as captured at run time — never the live spinboxes,
             # which the user may have retuned for a later run before saving
             # this (asynchronous) review.

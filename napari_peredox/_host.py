@@ -145,6 +145,46 @@ def assign_to_hosts(
     return para_to_host, vac_to_host, dropped
 
 
+def assign_vacuoles_to_hosts(
+    vac_labels: np.ndarray,
+    host_labels: np.ndarray,
+) -> tuple[dict[int, int], list[int]]:
+    """
+    Assign each Stage-1 vacuole to a host by majority pixel overlap.
+
+    Counts vacuoles **from the vacuole mask itself**, so a vacuole whose
+    parasites were never resolved (dim bodies, or all rejected during curation)
+    is still counted and measured.  assign_to_hosts() can only see vacuoles via
+    their member parasites, so it silently misses those.
+
+    Same tie-break as assign_to_hosts(): np.bincount + argmax resolves equal
+    counts to the lowest index, and a vacuole whose plurality pixel is
+    background is dropped (it lies outside every accepted host).
+
+    Returns
+    -------
+    vac_to_host : dict {vacuole_id → host_id}
+    dropped : list[int]
+        Vacuole labels with no host majority.
+    """
+    from skimage.measure import regionprops
+
+    vac_to_host: dict[int, int] = {}
+    dropped: list[int] = []
+    if vac_labels is None or vac_labels.max() == 0:
+        return vac_to_host, dropped
+
+    for rp in regionprops(vac_labels):
+        mask = vac_labels[rp.slice] == rp.label
+        counts = np.bincount(host_labels[rp.slice][mask])
+        winner = int(np.argmax(counts))
+        if winner == 0:
+            dropped.append(int(rp.label))
+        else:
+            vac_to_host[int(rp.label)] = winner
+    return vac_to_host, dropped
+
+
 def measure_hosts(
     host_labels: np.ndarray,
     para_labels: np.ndarray,
@@ -428,6 +468,7 @@ def host_vacuole_summary(
         "median_vacuole_ratio_intden",
         "mean_parasite_ratio",
         "median_parasite_ratio",
+        "n_vacuoles_with_parasites",
     ]
     idx = pd.Index([int(h) for h in host_ids], name="host_id")
     out = pd.DataFrame(index=idx, columns=cols, dtype=float)
@@ -435,6 +476,7 @@ def host_vacuole_summary(
     out["vacuole_area_um2_total"] = 0.0
     out["mean_parasites_per_vacuole"] = 0.0
     out["max_parasites_per_vacuole"] = 0
+    out["n_vacuoles_with_parasites"] = 0
 
     if vac_df is None or vac_df.empty or "host_id" not in vac_df.columns:
         return out
@@ -453,6 +495,9 @@ def host_vacuole_summary(
         out.loc[h, "max_parasites_per_vacuole"] = int(
             grp["parasites_per_vacuole"].max()
         )
+        out.loc[h, "n_vacuoles_with_parasites"] = int(
+            (grp["parasites_per_vacuole"] > 0).sum()
+        )
         out.loc[h, "mean_vacuole_ratio_intden"] = float(grp["ratio_intden"].mean())
         out.loc[h, "median_vacuole_ratio_intden"] = float(grp["ratio_intden"].median())
         if grp["mean_parasite_ratio"].notna().any():
@@ -461,4 +506,5 @@ def host_vacuole_summary(
                 grp["median_parasite_ratio"].median()
             )
     out["max_parasites_per_vacuole"] = out["max_parasites_per_vacuole"].fillna(0)
+    out["n_vacuoles_with_parasites"] = out["n_vacuoles_with_parasites"].fillna(0)
     return out

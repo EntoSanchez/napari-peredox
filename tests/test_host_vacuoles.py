@@ -177,3 +177,60 @@ def test_measure_hosts_defaults_to_parasite_exclusion():
     )
     assert df.loc[1, "area_px"] == 324.0 - 18.0  # two 9 px parasites
     assert df.loc[1, "excluded_area_px"] == 18.0
+
+
+# ── Vacuole counting independent of parasite detection ───────────────────────
+
+
+def _empty_vacuole_scene():
+    """Host 1 holds vacuole 1 (with a parasite) and vacuole 2 (no parasite)."""
+    hosts = np.zeros((40, 40), dtype=np.int32)
+    hosts[2:38, 2:38] = 1
+    vacs = np.zeros_like(hosts)
+    vacs[5:13, 5:13] = 1  # 64 px, has a parasite
+    vacs[20:28, 20:28] = 2  # 64 px, no parasite detected inside
+    paras = np.zeros_like(hosts)
+    paras[6:10, 6:10] = 1
+    img = np.ones((40, 40, 2), dtype=np.float32)
+    return hosts, vacs, paras, img
+
+
+def test_assign_vacuoles_by_mask_overlap_finds_empty_vacuoles():
+    from napari_peredox._host import assign_vacuoles_to_hosts
+
+    hosts, vacs, _paras, _img = _empty_vacuole_scene()
+    v2h, dropped = assign_vacuoles_to_hosts(vacs, hosts)
+    assert v2h == {1: 1, 2: 1}  # both vacuoles found, not just the occupied one
+    assert dropped == []
+
+
+def test_assign_vacuoles_drops_vacuole_outside_any_host():
+    from napari_peredox._host import assign_vacuoles_to_hosts
+
+    hosts = np.zeros((30, 30), dtype=np.int32)
+    hosts[2:12, 2:12] = 1
+    vacs = np.zeros_like(hosts)
+    vacs[20:26, 20:26] = 1  # entirely outside the host
+    v2h, dropped = assign_vacuoles_to_hosts(vacs, hosts)
+    assert v2h == {}
+    assert dropped == [1]
+
+
+def test_empty_vacuole_counted_and_measured():
+    from napari_peredox._host import assign_vacuoles_to_hosts
+
+    hosts, vacs, paras, img = _empty_vacuole_scene()
+    v2h, _ = assign_vacuoles_to_hosts(vacs, hosts)
+    h = measure_hosts(
+        hosts, paras, img, para_to_host={1: 1}, vac_to_host=v2h,
+        dilation_px=0, exclude_labels=vacs,
+    )
+    assert int(h.loc[1, "n_vacuoles"]) == 2  # was 1 before the fix
+
+    vdf = measure_vacuoles_in_hosts(vacs, paras, img, v2h, vacuole_map={1: 1})
+    assert sorted(vdf.index.tolist()) == [1, 2]
+    assert int(vdf.loc[2, "parasites_per_vacuole"]) == 0
+
+    s = host_vacuole_summary(vdf, host_ids=[1])
+    assert s.loc[1, "vacuole_area_px_total"] == 128.0  # both vacuoles
+    assert int(s.loc[1, "n_vacuoles_with_parasites"]) == 1

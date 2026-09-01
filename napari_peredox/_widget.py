@@ -2225,6 +2225,7 @@ class PeredoxWidget(QWidget):
 
         from ._host import (
             assign_to_hosts,
+            assign_vacuoles_to_hosts,
             drop_infection_columns,
             host_vacuole_summary,
             measure_hosts,
@@ -2240,6 +2241,11 @@ class PeredoxWidget(QWidget):
                 self._host_labels,
                 self._host_vac_map if self._host_vac_map else None,
             )
+            _vl = self._host_vac_labels
+            if _vl is not None and np.asarray(_vl).max() > 0:
+                # Vacuole count comes from the mask, not from parasites.
+                vac_direct, _ = assign_vacuoles_to_hosts(_vl, self._host_labels)
+                vac_to_host = {**vac_to_host, **vac_direct}
             if dropped:
                 self._log_msg(
                     f"{len(dropped)} parasite(s) had no host majority and were "
