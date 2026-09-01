@@ -359,8 +359,8 @@ class _HostWorker(QObject):
 class _HostParasiteWorker(QObject):
     """Vacuole→parasite detection on the host-masked image (spec §4 H2)."""
 
-    finished = Signal(object, object, object, object)
-    # (para_labels, vacuole_map, features, para_measurements)
+    finished = Signal(object, object, object, object, object)
+    # (para_labels, vacuole_map, features, para_measurements, vac_labels)
     error = Signal(str)
     progress = Signal(str)
 
@@ -486,7 +486,9 @@ class _HostParasiteWorker(QObject):
 
             n_para = len(np.unique(para_labels)) - 1
             self.progress.emit(f"Stage H2 done: {n_para} parasites in hosts.")
-            self.finished.emit(para_labels, vacuole_map, features, para_measurements)
+            self.finished.emit(
+                para_labels, vacuole_map, features, para_measurements, vac_labels
+            )
         except Exception:
             import traceback
 
@@ -519,6 +521,7 @@ class PeredoxWidget(QWidget):
         self._host_labels: np.ndarray | None = None
         self._host_para_labels: np.ndarray | None = None
         self._host_vac_map: dict = {}
+        self._host_vac_labels: np.ndarray | None = None
         self._host_features = None
         self._host_para_measurements = None
         self._host_measurements = None
@@ -2053,6 +2056,7 @@ class PeredoxWidget(QWidget):
         vacuole_map: dict,
         features,
         para_measurements,
+        vac_labels: np.ndarray | None = None,
     ) -> None:
         if self._host_only.isChecked():
             # Host-only mode was enabled while this worker ran — its parasite
@@ -2072,6 +2076,7 @@ class PeredoxWidget(QWidget):
         self._host_vac_map = vacuole_map
         self._host_features = features
         self._host_para_measurements = para_measurements
+        self._host_vac_labels = vac_labels
         stem = self._image_stem
 
         layer_name = f"{stem}_host_parasites"
@@ -2191,6 +2196,7 @@ class PeredoxWidget(QWidget):
             # rows for hosts that were never assessed.
             self._host_para_labels = None
             self._host_vac_map = {}
+            self._host_vac_labels = None
             self._host_para_measurements = None
             para_labels = np.zeros_like(self._host_labels)
             layer_name = f"{self._image_stem}_host_parasites"
@@ -2217,7 +2223,13 @@ class PeredoxWidget(QWidget):
         ch_names[self._ch_mcherry.value()] = "mcherry"
         px = self._pixel_size.value()
 
-        from ._host import assign_to_hosts, drop_infection_columns, measure_hosts
+        from ._host import (
+            assign_to_hosts,
+            drop_infection_columns,
+            host_vacuole_summary,
+            measure_hosts,
+            measure_vacuoles_in_hosts,
+        )
 
         if host_only:
             para_to_host: dict[int, int] = {}
@@ -2241,6 +2253,8 @@ class PeredoxWidget(QWidget):
             para_to_host=para_to_host,
             vac_to_host=vac_to_host,
             dilation_px=self._host_dilation_px.value(),
+            # Whole PV lumen, not just parasite bodies (mCherry fills the PV).
+            exclude_labels=None if host_only else self._host_vac_labels,
             ch_cptsa=self._ch_cptsa.value(),
             ch_mcherry=self._ch_mcherry.value(),
             ch_names=ch_names,
@@ -2250,6 +2264,23 @@ class PeredoxWidget(QWidget):
             # Parasites were never assessed — the infection columns would read
             # as "verified uninfected", so they are dropped instead.
             hosts_df = drop_infection_columns(hosts_df)
+        else:
+            # Per-vacuole measurements folded into the host table.
+            vac_df = measure_vacuoles_in_hosts(
+                vac_labels=self._host_vac_labels,
+                para_labels=para_labels,
+                image=image,
+                vac_to_host=vac_to_host,
+                vacuole_map=self._host_vac_map or {},
+                ch_cptsa=self._ch_cptsa.value(),
+                ch_mcherry=self._ch_mcherry.value(),
+                ch_names=ch_names,
+                pixel_size_um=px if px > 0 else None,
+            )
+            if not hosts_df.empty:
+                hosts_df = hosts_df.join(
+                    host_vacuole_summary(vac_df, list(hosts_df.index))
+                )
         self._host_measurements = hosts_df
 
         # Tag each parasite row with its host
@@ -2261,6 +2292,9 @@ class PeredoxWidget(QWidget):
             self._host_para_measurements = self._host_para_measurements.copy()
             self._host_para_measurements["host_id"] = (
                 self._host_para_measurements.index.map(para_to_host)
+            )
+            self._host_para_measurements["vacuole_id"] = (
+                self._host_para_measurements.index.map(self._host_vac_map or {})
             )
             # Rejected / background-dropped parasites have no host_id (NaN) —
             # exclude them, matching the batch path's para_to_host semantics.

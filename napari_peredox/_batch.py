@@ -353,6 +353,64 @@ def save_mask_tiff(labels: np.ndarray, out_path: Path) -> None:
 # ── Background worker ─────────────────────────────────────────────────────────
 
 
+class _SkipMaskSave(Exception):
+    """Internal: masks were reloaded, so the save step is a no-op."""
+
+
+def _load_cached_masks(
+    mask_dir: Path,
+    file_stem: str,
+    safe_pos: str,
+    host_only: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[int, int]] | None:
+    """
+    Reload the mask TIFFs a previous host-mode run wrote for one position.
+
+    Lets the measurement stage be re-run after an analysis change without
+    paying for cpSAM segmentation again.  Returns
+    ``(host_labels, vac_labels, para_labels, vacuole_map)`` or None when the
+    required files are missing.
+
+    The parasite→vacuole map is rebuilt from the two saved masks by majority
+    pixel overlap, the same rule assign_to_hosts() uses for hosts.
+    """
+    import tifffile
+
+    host_path = mask_dir / f"{file_stem}_{safe_pos}_host_mask.tif"
+    if not host_path.exists():
+        return None
+    host_labels = tifffile.imread(str(host_path)).astype(np.int32)
+
+    if host_only:
+        zeros = np.zeros_like(host_labels)
+        return host_labels, zeros, zeros.copy(), {}
+
+    para_path = mask_dir / f"{file_stem}_{safe_pos}_host_para_mask.tif"
+    vac_path = mask_dir / f"{file_stem}_{safe_pos}_host_vac_mask.tif"
+    if not para_path.exists():
+        return None
+    para_labels = tifffile.imread(str(para_path)).astype(np.int32)
+    if vac_path.exists():
+        vac_labels = tifffile.imread(str(vac_path)).astype(np.int32)
+    else:
+        # Runs from before vacuole masks were saved: fall back to the parasite
+        # mask so the position still re-measures.  The caller checks the same
+        # path and logs that per-vacuole columns then describe parasite bodies
+        # rather than PV lumens.
+        vac_labels = para_labels.copy()
+
+    from skimage.measure import regionprops
+
+    vac_map: dict[int, int] = {}
+    for rp in regionprops(para_labels):
+        vals = vac_labels[rp.slice][para_labels[rp.slice] == rp.label]
+        counts = np.bincount(vals)
+        winner = int(np.argmax(counts))
+        if winner != 0:
+            vac_map[int(rp.label)] = winner
+    return host_labels, vac_labels, para_labels, vac_map
+
+
 class _BatchWorker(QObject):
     """
     Runs the full batch pipeline in a QThread so the napari UI stays responsive.
@@ -699,7 +757,9 @@ class _BatchWorker(QObject):
         from ._host import (
             assign_to_hosts,
             drop_infection_columns,
+            host_vacuole_summary,
             measure_hosts,
+            measure_vacuoles_in_hosts,
             segment_host_cells,
         )
         from ._measure import measure_pvs
@@ -731,89 +791,135 @@ class _BatchWorker(QObject):
             host_min_px, host_max_px = 0.0, 1e9
             vac_min_px, vac_max_px = 0.0, 1e9
 
-        # ── Stage H1: hosts (+ optional host classifier) ─────────────────────
-        # Host diameter comes from the Host-box spinbox, never from the
-        # parasite/vacuole diameter (which is hidden in host-only mode).
-        self.progress.emit(
-            pos_idx,
-            total,
-            "    Segmenting host cells (cpSAM — up to a few minutes on busy "
-            "fields or a shared GPU)…",
-        )
-        host_labels, _, hstats = segment_host_cells(
-            image=image,
-            channel_index=p.get("host_ch", ch_mcherry),
-            clip_percentile=p.get("clip_percentile", 99.0),
-            diameter=p.get("host_diameter"),
-            flow_threshold=p.get("flow_threshold", 0.4),
-            cellprob_threshold=p.get("cellprob_threshold", 0.0),
-            min_area_px=host_min_px,
-            max_area_px=host_max_px,
-        )
-        host_clf = p.get("host_classifier")
-        if host_clf is not None and host_labels.max() > 0:
-            from ._learning import extract_features
-            from ._segment import apply_classifier_filter
+        reused = False
 
-            feats = extract_features(
-                labels=host_labels,
-                image=image,
-                seg_channel=p.get("host_ch", ch_mcherry),
-                ch_cptsa=ch_cptsa,
-                ch_mcherry=ch_mcherry,
-                ch_names=ch_names,
-            )
-            host_labels = apply_classifier_filter(host_labels, feats, host_clf)
-        n_hosts = len(np.unique(host_labels)) - 1
-        self.progress.emit(
-            pos_idx,
-            total,
-            f"    Hosts: {hstats['total_raw']} raw → {n_hosts} kept.",
-        )
-        if n_hosts == 0:
-            self.progress.emit(pos_idx, total, "    No hosts — position skipped.")
-            return
+        # ── Re-measure mode: reload masks from a previous run ────────────────
+        # Lets an analysis change (new columns, different exclusion) be applied
+        # without paying for cpSAM segmentation again.
+        if p.get("reuse_masks"):
+            cached = _load_cached_masks(mask_dir, file_stem, safe_pos, host_only)
+            if cached is None:
+                self.progress.emit(
+                    pos_idx,
+                    total,
+                    "    No saved masks for this position — segmenting normally.",
+                )
+            else:
+                host_labels, vac_labels, para_labels, vac_map = cached
+                if (
+                    not host_only
+                    and not (
+                        mask_dir / f"{file_stem}_{safe_pos}_host_vac_mask.tif"
+                    ).exists()
+                ):
+                    self.progress.emit(
+                        pos_idx,
+                        total,
+                        "    NOTE: no saved vacuole mask (run predates them) — "
+                        "per-vacuole columns describe parasite bodies, not PV "
+                        "lumens. Re-segment for true lumen measurements.",
+                    )
+                n_hosts = len(np.unique(host_labels)) - 1
+                self.progress.emit(
+                    pos_idx,
+                    total,
+                    f"    Reusing saved masks: {n_hosts} hosts, "
+                    f"{len(np.unique(para_labels)) - 1} parasites.",
+                )
+                if n_hosts == 0:
+                    self.progress.emit(
+                        pos_idx, total, "    No hosts in saved mask — skipped."
+                    )
+                    return
+                reused = True
 
-        # ── Stage H2: parasites inside hosts (auto) ──────────────────────────
-        if host_only:
-            # Host-only mode: parasites are never looked for.
-            para_labels = np.zeros_like(host_labels)
-            vac_map: dict[int, int] = {}
-        else:
+        if not reused:
+            # ── Stage H1: hosts (+ optional host classifier) ─────────────────────
+            # Host diameter comes from the Host-box spinbox, never from the
+            # parasite/vacuole diameter (which is hidden in host-only mode).
             self.progress.emit(
-                pos_idx, total, "    Detecting parasites inside hosts (cpSAM)…"
+                pos_idx,
+                total,
+                "    Segmenting host cells (cpSAM — up to a few minutes on busy "
+                "fields or a shared GPU)…",
             )
-            masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
-            vac_labels, _, _ = segment_pvs(
-                image=masked,
-                channel_index=p.get("vac_seg_ch", 1),
-                use_composite=p.get("use_composite", False),
-                min_area_px=vac_min_px,
-                max_area_px=vac_max_px,
-                max_eccentricity=p.get("max_eccentricity", 0.85),
-                min_solidity=p.get("min_solidity", 0.70),
-                diameter=None,
+            host_labels, _, hstats = segment_host_cells(
+                image=image,
+                channel_index=p.get("host_ch", ch_mcherry),
+                clip_percentile=p.get("clip_percentile", 99.0),
+                diameter=p.get("host_diameter"),
                 flow_threshold=p.get("flow_threshold", 0.4),
                 cellprob_threshold=p.get("cellprob_threshold", 0.0),
-                threshold_method=p.get("threshold_method", "none"),
-                threshold_channel=p.get("threshold_channel", p.get("vac_seg_ch", 1)),
-                threshold_value=p.get("threshold_value", 0.0),
-                threshold_percentile=p.get("threshold_percentile", 50.0),
+                min_area_px=host_min_px,
+                max_area_px=host_max_px,
             )
-            para_labels, vac_map = segment_parasites_in_vacuoles(
-                image=masked,
-                vac_labels=vac_labels,
-                seg_channel=p.get("seg_ch", 0),
-                model=None,
-                min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
-                if file_px > 0
-                else 0.0,
-                max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
-                if file_px > 0
-                else 1e9,
-                max_eccentricity=p.get("max_eccentricity", 0.85),
-                min_solidity=p.get("min_solidity", 0.70),
+            host_clf = p.get("host_classifier")
+            if host_clf is not None and host_labels.max() > 0:
+                from ._learning import extract_features
+                from ._segment import apply_classifier_filter
+
+                feats = extract_features(
+                    labels=host_labels,
+                    image=image,
+                    seg_channel=p.get("host_ch", ch_mcherry),
+                    ch_cptsa=ch_cptsa,
+                    ch_mcherry=ch_mcherry,
+                    ch_names=ch_names,
+                )
+                host_labels = apply_classifier_filter(host_labels, feats, host_clf)
+            n_hosts = len(np.unique(host_labels)) - 1
+            self.progress.emit(
+                pos_idx,
+                total,
+                f"    Hosts: {hstats['total_raw']} raw → {n_hosts} kept.",
             )
+            if n_hosts == 0:
+                self.progress.emit(pos_idx, total, "    No hosts — position skipped.")
+                return
+
+            # ── Stage H2: parasites inside hosts (auto) ──────────────────────────
+            if host_only:
+                # Host-only mode: parasites are never looked for.
+                para_labels = np.zeros_like(host_labels)
+                vac_labels = np.zeros_like(host_labels)
+                vac_map: dict[int, int] = {}
+            else:
+                self.progress.emit(
+                    pos_idx, total, "    Detecting parasites inside hosts (cpSAM)…"
+                )
+                masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
+                vac_labels, _, _ = segment_pvs(
+                    image=masked,
+                    channel_index=p.get("vac_seg_ch", 1),
+                    use_composite=p.get("use_composite", False),
+                    min_area_px=vac_min_px,
+                    max_area_px=vac_max_px,
+                    max_eccentricity=p.get("max_eccentricity", 0.85),
+                    min_solidity=p.get("min_solidity", 0.70),
+                    diameter=None,
+                    flow_threshold=p.get("flow_threshold", 0.4),
+                    cellprob_threshold=p.get("cellprob_threshold", 0.0),
+                    threshold_method=p.get("threshold_method", "none"),
+                    threshold_channel=p.get(
+                        "threshold_channel", p.get("vac_seg_ch", 1)
+                    ),
+                    threshold_value=p.get("threshold_value", 0.0),
+                    threshold_percentile=p.get("threshold_percentile", 50.0),
+                )
+                para_labels, vac_map = segment_parasites_in_vacuoles(
+                    image=masked,
+                    vac_labels=vac_labels,
+                    seg_channel=p.get("seg_ch", 0),
+                    model=None,
+                    min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
+                    if file_px > 0
+                    else 0.0,
+                    max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
+                    if file_px > 0
+                    else 1e9,
+                    max_eccentricity=p.get("max_eccentricity", 0.85),
+                    min_solidity=p.get("min_solidity", 0.70),
+                )
 
         # ── Stage H3: assign + measure ───────────────────────────────────────
         if host_only:
@@ -837,6 +943,9 @@ class _BatchWorker(QObject):
             para_to_host=para_to_host,
             vac_to_host=vac_to_host,
             dilation_px=p.get("host_dilation_px", 3),
+            # Remove the whole PV lumen, not just parasite bodies: mCherry
+            # fills the vacuole, so inter-parasite space is parasite signal.
+            exclude_labels=None if host_only else vac_labels,
             ch_cptsa=ch_cptsa,
             ch_mcherry=ch_mcherry,
             ch_names=ch_names,
@@ -847,6 +956,7 @@ class _BatchWorker(QObject):
             # as "verified uninfected", so they are dropped instead.
             hosts_df = drop_infection_columns(hosts_df)
             para_df = pd.DataFrame()
+            vac_df = pd.DataFrame()
         else:
             para_df = measure_pvs(
                 labels=para_labels,
@@ -858,6 +968,24 @@ class _BatchWorker(QObject):
             )
             if not para_df.empty:
                 para_df["host_id"] = para_df.index.map(para_to_host)
+                para_df["vacuole_id"] = para_df.index.map(vac_map)
+
+            # Per-vacuole measurements, folded into hosts.csv as per-host
+            # summary columns (vacuole counts, areas, lumen ratios).
+            vac_df = measure_vacuoles_in_hosts(
+                vac_labels=vac_labels,
+                para_labels=para_labels,
+                image=image,
+                vac_to_host=vac_to_host,
+                vacuole_map=vac_map,
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                ch_names=ch_names,
+                pixel_size_um=file_px if file_px > 0 else None,
+            )
+            if not hosts_df.empty:
+                summary = host_vacuole_summary(vac_df, list(hosts_df.index))
+                hosts_df = hosts_df.join(summary)
 
         # Experimental metadata (same tagging idea as PV mode)
         for df in (hosts_df, para_df):
@@ -885,6 +1013,8 @@ class _BatchWorker(QObject):
 
         # ── Persist masks; stash results + curation entry ────────────────────
         try:
+            if reused:
+                raise _SkipMaskSave
             save_mask_tiff(
                 host_labels, mask_dir / f"{file_stem}_{safe_pos}_host_mask.tif"
             )
@@ -893,6 +1023,12 @@ class _BatchWorker(QObject):
                     para_labels,
                     mask_dir / f"{file_stem}_{safe_pos}_host_para_mask.tif",
                 )
+                save_mask_tiff(
+                    vac_labels,
+                    mask_dir / f"{file_stem}_{safe_pos}_host_vac_mask.tif",
+                )
+        except _SkipMaskSave:
+            pass  # masks came from disk; nothing to rewrite
         except Exception as exc:
             self.progress.emit(pos_idx, total, f"    WARNING: mask save failed: {exc}")
 
@@ -908,6 +1044,7 @@ class _BatchWorker(QObject):
                 "image": image,
                 "host_labels": host_labels,
                 "para_labels": para_labels,
+                "vac_labels": vac_labels,
                 "para_to_host": para_to_host,
                 "vac_map": vac_map,
                 "file_px": file_px,
@@ -1438,6 +1575,18 @@ class BatchWidget(QWidget):
         self._use_classifier = QCheckBox("Apply classifier filter")
         self._use_classifier.setChecked(False)
         clf_layout.addWidget(self._use_classifier)
+        self._reuse_masks = QCheckBox(
+            "Re-measure: reuse saved masks (skip segmentation)"
+        )
+        self._reuse_masks.setToolTip(
+            "Host modes only. Reload each position's mask TIFFs from the "
+            "output folder's masks/ directory and recompute measurements "
+            "only — use after an analysis change (new columns, different "
+            "exclusion) to avoid re-running cpSAM. Positions without saved "
+            "masks are segmented normally."
+        )
+        clf_layout.addWidget(self._reuse_masks)
+
         self._clf_label = QLabel("Classifier: not loaded")
         self._clf_label.setWordWrap(True)
         clf_layout.addWidget(self._clf_label)
@@ -1832,6 +1981,7 @@ class BatchWidget(QWidget):
             "seg_backend": self._seg_backend.currentIndex(),  # 0=cpSAM, 1=StarDist
             "annot_dir": self._annot_dir.text(),
             "analysis_mode": analysis_mode,
+            "reuse_masks": self._reuse_masks.isChecked() and analysis_mode != "pv",
             "host_diameter": (
                 float(self._host_diameter.value())
                 if self._host_diameter.value() > 0
@@ -1888,8 +2038,15 @@ class BatchWidget(QWidget):
 
         # Host modes always run Cellpose for Stage H1, regardless of the
         # (possibly hidden) StarDist backend selection — preload it so the
-        # CUDA context is established in the main thread.
-        if self._seg_backend.currentIndex() == 1 and analysis_mode == "pv":
+        # CUDA context is established in the main thread.  Re-measure runs may
+        # still need it for positions whose masks are missing, but loading it
+        # up front would defeat the point, so it loads lazily there.
+        if params["reuse_masks"]:
+            self._log_msg(
+                "Re-measure mode — reusing saved masks; segmentation runs only "
+                "for positions with no mask on disk."
+            )
+        elif self._seg_backend.currentIndex() == 1 and analysis_mode == "pv":
             self._log_msg("Using fine-tuned StarDist model for segmentation.")
         else:
             # Pre-load the Cellpose model in the main thread so the CUDA context is
@@ -2416,7 +2573,13 @@ class BatchWidget(QWidget):
         from ._curation import VacuoleCurationWidget
 
         def _on_save(decisions: dict, curated_hosts: np.ndarray):
-            from ._host import assign_to_hosts, drop_infection_columns, measure_hosts
+            from ._host import (
+                assign_to_hosts,
+                drop_infection_columns,
+                host_vacuole_summary,
+                measure_hosts,
+                measure_vacuoles_in_hosts,
+            )
 
             host_only = bool(item.get("host_only"))
             hosts = curated_hosts.copy()
@@ -2450,6 +2613,7 @@ class BatchWidget(QWidget):
                 para_to_host=para_to_host,
                 vac_to_host=vac_to_host,
                 dilation_px=self._host_dilation_px.value(),
+                exclude_labels=None if host_only else item.get("vac_labels"),
                 ch_cptsa=ch_cptsa,
                 ch_mcherry=ch_mcherry,
                 ch_names=ch_names,
@@ -2471,7 +2635,25 @@ class BatchWidget(QWidget):
                 )
                 if not para_df.empty:
                     para_df["host_id"] = para_df.index.map(para_to_host)
+                    para_df["vacuole_id"] = para_df.index.map(item.get("vac_map") or {})
                     para_df = para_df[para_df["host_id"].notna()]
+
+                # Recompute the per-host vacuole summary against curated hosts.
+                vac_df = measure_vacuoles_in_hosts(
+                    vac_labels=item.get("vac_labels"),
+                    para_labels=item["para_labels"],
+                    image=item["image"],
+                    vac_to_host=vac_to_host,
+                    vacuole_map=item.get("vac_map") or {},
+                    ch_cptsa=ch_cptsa,
+                    ch_mcherry=ch_mcherry,
+                    ch_names=ch_names,
+                    pixel_size_um=file_px if file_px > 0 else None,
+                )
+                if not hosts_df.empty:
+                    hosts_df = hosts_df.join(
+                        host_vacuole_summary(vac_df, list(hosts_df.index))
+                    )
             for df in (hosts_df, para_df):
                 if df is not None and not df.empty:
                     df["file"] = item["file"]

@@ -152,6 +152,7 @@ def measure_hosts(
     para_to_host: dict[int, int],
     vac_to_host: dict[int, int],
     dilation_px: int = 3,
+    exclude_labels: np.ndarray | None = None,
     ch_cptsa: int = 0,
     ch_mcherry: int = 1,
     ch_names: dict[int, str] | None = None,
@@ -160,8 +161,10 @@ def measure_hosts(
     """
     Measure Peredox fluorescence per host cell on the parasite-free cytosol.
 
-    The cytosol mask is the host mask minus all parasite pixels dilated by
-    `dilation_px` (buffer against parasite signal bleed-over).  Ratios come
+    The cytosol mask is the host mask minus `exclude_labels` (or the parasite
+    labels when none is given) dilated by `dilation_px` — a buffer against
+    signal bleed-over.  Host+parasites mode passes the Stage-1 vacuole masks
+    so the whole PV lumen is removed, not just the parasite bodies.  Ratios come
     from measure_pvs() run on that cytosol label image; host label IDs are
     preserved, so the returned index is the host ID.
 
@@ -180,12 +183,18 @@ def measure_hosts(
     host_ids = sorted(int(v) for v in np.unique(host_labels) if v != 0)
 
     # ── Cytosol: host minus dilated parasite pixels ──────────────────────────
+    # What gets subtracted from the host: the whole vacuole mask when the
+    # caller supplies one (mCherry fills the entire PV lumen, so the dead space
+    # between parasites still carries parasite-derived signal), otherwise just
+    # the parasite bodies.
+    exclude_src = para_labels if exclude_labels is None else exclude_labels
     cytosol = host_labels.copy()
-    if para_labels.max() > 0:
-        para_bin = para_labels > 0
+    excluded_mask = np.zeros(host_labels.shape, dtype=bool)
+    if exclude_src is not None and exclude_src.max() > 0:
+        excluded_mask = exclude_src > 0
         if dilation_px > 0:
-            para_bin = dilation(para_bin, disk(dilation_px))
-        cytosol[para_bin] = 0
+            excluded_mask = dilation(excluded_mask, disk(dilation_px))
+        cytosol[excluded_mask] = 0
 
     df = measure_pvs(cytosol, image, ch_cptsa, ch_mcherry, ch_names, pixel_size_um)
 
@@ -234,6 +243,10 @@ def measure_hosts(
     df["parasite_area_px"] = [para_area.get(h, 0.0) for h in df.index]
     df["host_area_px_total"] = [total_area.get(h, np.nan) for h in df.index]
     df["on_border"] = [on_border.get(h, False) for h in df.index]
+    excl_area = {
+        int(h): float((excluded_mask & (host_labels == h)).sum()) for h in host_ids
+    }
+    df["excluded_area_px"] = [excl_area.get(h, 0.0) for h in df.index]
 
     df.index.name = "host_id"
     return df
@@ -307,3 +320,145 @@ def segment_host_cells(
         }
     )
     return filtered, raw_labels, stats
+
+
+def measure_vacuoles_in_hosts(
+    vac_labels: np.ndarray,
+    para_labels: np.ndarray,
+    image: np.ndarray,
+    vac_to_host: dict[int, int],
+    vacuole_map: dict[int, int],
+    ch_cptsa: int = 0,
+    ch_mcherry: int = 1,
+    ch_names: dict[int, str] | None = None,
+    pixel_size_um: float | None = None,
+) -> pd.DataFrame:
+    """
+    Measure each parasitophorous vacuole inside an accepted host cell.
+
+    One row per vacuole, indexed by ``vacuole_id``.  Measurements come from
+    measure_pvs() run on the Stage-1 vacuole masks, so the ratio is the
+    whole-lumen ratio — the correct PV readout, since mCherry fills the entire
+    vacuole rather than only the parasite bodies (same reasoning as PV mode).
+
+    Vacuoles with no host assignment in *vac_to_host* are dropped: under the
+    population rule only vacuoles inside accepted fluorescent hosts are
+    analysed.
+
+    Parameters
+    ----------
+    vac_labels : np.ndarray (H, W) int32
+        Stage-1 vacuole label image.
+    para_labels : np.ndarray (H, W) int32
+        Per-parasite label image (for the per-vacuole parasite aggregates).
+    image : np.ndarray (H, W, C)
+    vac_to_host : dict {vacuole_id → host_id}   from assign_to_hosts()
+    vacuole_map : dict {parasite_label → vacuole_id}
+    ch_cptsa, ch_mcherry, ch_names, pixel_size_um
+        As in measure_pvs().
+
+    Returns
+    -------
+    pd.DataFrame indexed by vacuole_id, with the measure_pvs() columns plus
+    ``host_id``, ``parasites_per_vacuole``, ``mean_parasite_ratio`` and
+    ``median_parasite_ratio``.  Empty frame when no vacuole is assigned.
+    """
+    from ._measure import measure_pvs
+
+    if vac_labels is None or vac_labels.max() == 0 or not vac_to_host:
+        return pd.DataFrame()
+
+    df = measure_pvs(vac_labels, image, ch_cptsa, ch_mcherry, ch_names, pixel_size_um)
+    if df.empty:
+        return pd.DataFrame()
+
+    # Keep only vacuoles that belong to an accepted host.
+    keep = [v for v in df.index if int(v) in vac_to_host]
+    df = df.loc[keep].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df["host_id"] = [vac_to_host[int(v)] for v in df.index]
+
+    # Per-vacuole parasite counts and ratio aggregates.
+    para_df = measure_pvs(
+        para_labels, image, ch_cptsa, ch_mcherry, ch_names, pixel_size_um
+    )
+    counts: dict[int, int] = {}
+    ratios: dict[int, list[float]] = {}
+    for para_label, vac_id in vacuole_map.items():
+        vac_id = int(vac_id)
+        counts[vac_id] = counts.get(vac_id, 0) + 1
+        if not para_df.empty and para_label in para_df.index:
+            r = para_df.loc[para_label, "ratio_intden"]
+            if not pd.isna(r):
+                ratios.setdefault(vac_id, []).append(float(r))
+
+    df["parasites_per_vacuole"] = [counts.get(int(v), 0) for v in df.index]
+    df["mean_parasite_ratio"] = [
+        float(np.mean(ratios[int(v)])) if int(v) in ratios else np.nan for v in df.index
+    ]
+    df["median_parasite_ratio"] = [
+        float(np.median(ratios[int(v)])) if int(v) in ratios else np.nan
+        for v in df.index
+    ]
+    df.index = df.index.astype(int)
+    df.index.name = "vacuole_id"
+    return df
+
+
+def host_vacuole_summary(
+    vac_df: pd.DataFrame,
+    host_ids: list[int],
+) -> pd.DataFrame:
+    """
+    Aggregate a per-vacuole table (measure_vacuoles_in_hosts) per host cell.
+
+    Returns one row per host in *host_ids* — hosts with no vacuoles get zero
+    counts and NaN ratios, so an uninfected host is never confused with a
+    missing measurement.  Columns are the per-host vacuole/parasite summary
+    folded into hosts.csv.
+    """
+    cols = [
+        "vacuole_area_px_total",
+        "vacuole_area_um2_total",
+        "mean_vacuole_area_px",
+        "mean_parasites_per_vacuole",
+        "max_parasites_per_vacuole",
+        "mean_vacuole_ratio_intden",
+        "median_vacuole_ratio_intden",
+        "mean_parasite_ratio",
+        "median_parasite_ratio",
+    ]
+    idx = pd.Index([int(h) for h in host_ids], name="host_id")
+    out = pd.DataFrame(index=idx, columns=cols, dtype=float)
+    out["vacuole_area_px_total"] = 0.0
+    out["vacuole_area_um2_total"] = 0.0
+    out["mean_parasites_per_vacuole"] = 0.0
+    out["max_parasites_per_vacuole"] = 0
+
+    if vac_df is None or vac_df.empty or "host_id" not in vac_df.columns:
+        return out
+
+    for host_id, grp in vac_df.groupby("host_id"):
+        h = int(host_id)
+        if h not in out.index:
+            continue
+        out.loc[h, "vacuole_area_px_total"] = float(grp["area_px"].sum())
+        if "area_um2" in grp.columns:
+            out.loc[h, "vacuole_area_um2_total"] = float(grp["area_um2"].sum())
+        out.loc[h, "mean_vacuole_area_px"] = float(grp["area_px"].mean())
+        out.loc[h, "mean_parasites_per_vacuole"] = float(
+            grp["parasites_per_vacuole"].mean()
+        )
+        out.loc[h, "max_parasites_per_vacuole"] = int(
+            grp["parasites_per_vacuole"].max()
+        )
+        out.loc[h, "mean_vacuole_ratio_intden"] = float(grp["ratio_intden"].mean())
+        out.loc[h, "median_vacuole_ratio_intden"] = float(grp["ratio_intden"].median())
+        if grp["mean_parasite_ratio"].notna().any():
+            out.loc[h, "mean_parasite_ratio"] = float(grp["mean_parasite_ratio"].mean())
+            out.loc[h, "median_parasite_ratio"] = float(
+                grp["median_parasite_ratio"].median()
+            )
+    out["max_parasites_per_vacuole"] = out["max_parasites_per_vacuole"].fillna(0)
+    return out

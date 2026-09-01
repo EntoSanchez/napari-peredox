@@ -202,6 +202,36 @@ writes `hosts.csv` **without** the parasite-assessment columns (same
 `INFECTION_COLS` semantics as the single-image checkbox), no
 `host_parasites.csv`, and no `*_host_para_mask.tif`.
 
+### Vacuole reporting (host + parasites mode)
+
+Per-vacuole measurements are **folded into `hosts.csv`** — there is no separate
+vacuole table. `_host.measure_vacuoles_in_hosts()` measures each Stage-1
+vacuole mask (whole-lumen ratio, the correct PV readout since mCherry fills the
+vacuole) and `_host.host_vacuole_summary()` aggregates it per host, adding:
+
+`mean_parasites_per_vacuole`, `max_parasites_per_vacuole`,
+`vacuole_area_px_total`, `vacuole_area_um2_total`, `mean_vacuole_area_px`,
+`mean_vacuole_ratio_intden`, `median_vacuole_ratio_intden`,
+`mean_parasite_ratio`, `median_parasite_ratio` — alongside the existing
+`n_vacuoles` / `n_parasites` / `parasite_area_px`. Hosts with no vacuoles get
+zero counts and NaN ratios. `host_parasites.csv` gains a `vacuole_id` column.
+
+**Host cytosol excludes the whole vacuole mask** (`measure_hosts(exclude_labels=)`),
+not just parasite bodies: the inter-parasite lumen carries parasite-derived
+mCherry. `excluded_area_px` records how much was removed. Host-only mode passes
+no `exclude_labels`, so it keeps the parasite-pixel behaviour.
+
+### Re-measure mode (reuse saved masks)
+
+Output-tab checkbox **"Re-measure: reuse saved masks (skip segmentation)"**
+(host modes only). Each position's masks are reloaded from `masks/`
+(`*_host_mask.tif`, `*_host_vac_mask.tif`, `*_host_para_mask.tif`) by
+`_load_cached_masks()` and only measurement re-runs — the way to apply an
+analysis change without paying for cpSAM again. Positions with no saved mask
+are segmented normally; runs predating vacuole masks fall back to the parasite
+mask and log that per-vacuole columns then describe parasite bodies. Masks are
+not rewritten when reused.
+
 ### Population rule (spec §2)
 
 **All accepted fluorescent hosts are measured, infected or not** — uninfected
