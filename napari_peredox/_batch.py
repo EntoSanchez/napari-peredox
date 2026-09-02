@@ -764,7 +764,6 @@ class _BatchWorker(QObject):
             segment_host_cells,
         )
         from ._measure import measure_pvs
-        from ._segment import segment_parasites_in_vacuoles, segment_pvs
 
         host_only = p.get("analysis_mode") == "host_only"
         if p.get("seg_backend", 0) == 1 and not host_only:
@@ -786,11 +785,8 @@ class _BatchWorker(QObject):
         if file_px > 0:
             host_min_px = p["host_min_area_um2"] / (file_px**2)
             host_max_px = p["host_max_area_um2"] / (file_px**2)
-            vac_min_px = p.get("vac_min_area_um2", 20.0) / (file_px**2)
-            vac_max_px = p.get("vac_max_area_um2", 2000.0) / (file_px**2)
         else:
             host_min_px, host_max_px = 0.0, 1e9
-            vac_min_px, vac_max_px = 0.0, 1e9
 
         reused = False
 
@@ -878,49 +874,52 @@ class _BatchWorker(QObject):
                 self.progress.emit(pos_idx, total, "    No hosts — position skipped.")
                 return
 
-            # ── Stage H2: parasites inside hosts (auto) ──────────────────────────
-            if host_only:
-                # Host-only mode: parasites are never looked for.
-                para_labels = np.zeros_like(host_labels)
-                vac_labels = np.zeros_like(host_labels)
-                vac_map: dict[int, int] = {}
-            else:
+            # Stage H1 is all the worker does: parasites are detected during
+            # curation, inside the hosts the user actually accepts (PV batch
+            # mode works the same way).  Measurement happens after review.
+            try:
+                save_mask_tiff(
+                    host_labels, mask_dir / f"{file_stem}_{safe_pos}_host_mask.tif"
+                )
+            except Exception as exc:
                 self.progress.emit(
-                    pos_idx, total, "    Detecting parasites inside hosts (cpSAM)…"
+                    pos_idx, total, f"    WARNING: host mask save failed: {exc}"
                 )
-                masked = image * (host_labels > 0)[..., np.newaxis].astype(image.dtype)
-                vac_labels, _, _ = segment_pvs(
-                    image=masked,
-                    channel_index=p.get("vac_seg_ch", 1),
-                    use_composite=p.get("use_composite", False),
-                    min_area_px=vac_min_px,
-                    max_area_px=vac_max_px,
-                    max_eccentricity=p.get("max_eccentricity", 0.85),
-                    min_solidity=p.get("min_solidity", 0.70),
-                    diameter=None,
-                    flow_threshold=p.get("flow_threshold", 0.4),
-                    cellprob_threshold=p.get("cellprob_threshold", 0.0),
-                    threshold_method=p.get("threshold_method", "none"),
-                    threshold_channel=p.get(
-                        "threshold_channel", p.get("vac_seg_ch", 1)
-                    ),
-                    threshold_value=p.get("threshold_value", 0.0),
-                    threshold_percentile=p.get("threshold_percentile", 50.0),
-                )
-                para_labels, vac_map = segment_parasites_in_vacuoles(
-                    image=masked,
-                    vac_labels=vac_labels,
-                    seg_channel=p.get("seg_ch", 0),
-                    model=None,
-                    min_area_px=p.get("min_area_um2", 5.0) / (file_px**2)
-                    if file_px > 0
-                    else 0.0,
-                    max_area_px=p.get("max_area_um2", 200.0) / (file_px**2)
-                    if file_px > 0
-                    else 1e9,
-                    max_eccentricity=p.get("max_eccentricity", 0.85),
-                    min_solidity=p.get("min_solidity", 0.70),
-                )
+
+            curation_list.append(
+                {
+                    "mode": "host",
+                    "host_only": host_only,
+                    "needs_curation": True,
+                    "display_name": f"{file_stem} | {pos_name}",
+                    "file": file_stem,
+                    "position_name": pos_name,
+                    "image": image,
+                    "host_labels": host_labels,
+                    "vac_labels": None,
+                    "para_labels": None,
+                    "para_to_host": {},
+                    "vac_map": {},
+                    "file_px": file_px,
+                    "treatment": p["treatment"],
+                    "cell_line": p["cell_line"],
+                    "replicate": p["replicate"],
+                    "pos_idx": pos_idx,
+                    # Channels and segmentation settings as used by THIS run,
+                    # so a later review never reads retuned spinboxes.
+                    "host_ch": p.get("host_ch", ch_mcherry),
+                    "ch_cptsa": ch_cptsa,
+                    "ch_mcherry": ch_mcherry,
+                    "params": p,
+                }
+            )
+            self.progress.emit(
+                pos_idx,
+                total,
+                "    Hosts ready for review — parasites are detected after "
+                "host curation.",
+            )
+            return
 
         # ── Stage H3: assign + measure ───────────────────────────────────────
         if host_only:
@@ -2088,22 +2087,22 @@ class BatchWidget(QWidget):
         host mode (see `_process_host_position`).
         """
         if isinstance(result, dict):
-            # Host mode: `result` is {(file, pos) -> {"hosts", "parasites"}}.
-            # An empty dict means every position was skipped (no hosts found
-            # or the per-position pipeline failed) — curation_list is then
-            # empty too, so there's nothing to review or save.
-            if not result:
+            # Host mode: `result` is {(file, pos) -> {"hosts", "parasites"}},
+            # and it is EMPTY for a normal run - the worker only segments
+            # hosts, and measurement happens per position during curation.
+            # Positions to review are therefore counted from curation_list,
+            # not from result (which is pre-filled only in re-measure mode).
+            self._progress_bar.setValue(100)
+            if not curation_list:
                 self._result_df = None
                 self._host_results = {}
                 self._curation_data = []
                 self._curation_combo.clear()
-                self._progress_bar.setValue(100)
                 self._log_msg(
-                    "Host batch complete — no host cells detected in any position."
+                    "Host batch complete - no host cells detected in any position."
                 )
                 return
-            self._progress_bar.setValue(100)
-            self._host_results = result  # dict {(file, pos) -> {"hosts", "parasites"}}
+            self._host_results = dict(result)
             self._result_df = None
             self._curation_decisions = {}
             self._curation_data = curation_list
@@ -2114,12 +2113,20 @@ class BatchWidget(QWidget):
             self._btn_curate.setEnabled(True)
             self._btn_save_results.setEnabled(True)
             self._update_review_status()
-            n_hosts = sum(len(v["hosts"]) for v in result.values())
-            self._log_msg(
-                f"Host batch complete — {len(curation_list)} position(s), "
-                f"{n_hosts} host cells measured.\n"
-                f"Review positions to reject bad host masks, then save."
-            )
+            if any(i.get("needs_curation") for i in curation_list):
+                self._log_msg(
+                    f"Host batch complete - {len(curation_list)} position(s) "
+                    "segmented. Review each position: hosts (1/3) -> vacuoles "
+                    "(2/3) -> parasites (3/3). Measurements are produced when "
+                    "the parasite review is saved, so unreviewed positions "
+                    "contribute no rows."
+                )
+            else:
+                n_hosts = sum(len(v["hosts"]) for v in result.values())
+                self._log_msg(
+                    f"Re-measure complete - {len(curation_list)} position(s), "
+                    f"{n_hosts} host cells measured."
+                )
             return
 
         self._progress_bar.setValue(100)
@@ -2578,10 +2585,55 @@ class BatchWidget(QWidget):
             vac_win.show()
 
     def _open_host_position_curation(self, item: dict):
-        """Accept/reject/redraw host masks for one batch position."""
-        from ._curation import VacuoleCurationWidget
+        """
+        Three-pass curation for one host-mode position.
 
-        def _on_save(decisions: dict, curated_hosts: np.ndarray):
+        Pass 1 - hosts: accept/reject/redraw the host cells.
+        Pass 2 - vacuoles: detected INSIDE the accepted hosts, then reviewed.
+        Pass 3 - parasites: detected inside the accepted vacuoles (using the
+                 fine-tuned parasite model when the StarDist backend is
+                 selected), reviewed in the per-vacuole gallery.
+
+        Measurement runs after pass 3, so the saved numbers describe exactly
+        what the user accepted. Host-only positions stop after pass 1.
+        Mirrors the PV batch flow, where segmentation follows curation rather
+        than preceding it.
+        """
+        from qtpy.QtCore import QTimer
+
+        from ._curation import CurationWidget, VacuoleCurationWidget
+
+        p = item.get("params") or {}
+        host_only = bool(item.get("host_only"))
+        display_name = item["display_name"]
+        file_px = item["file_px"]
+        ch_cptsa = item.get("ch_cptsa", self._ch_cptsa.value())
+        ch_mcherry = item.get("ch_mcherry", self._ch_mcherry.value())
+        ch_names = {0: "ch0", 1: "ch1"}
+        ch_names[ch_cptsa] = "cptsa"
+        ch_names[ch_mcherry] = "mcherry"
+        px_um = file_px if file_px > 0 else None
+        annot_dir = p.get("annot_dir", self._annot_dir.text())
+        seg_backend = p.get("seg_backend", 0)
+
+        def area_px(um2: float, default: float) -> float:
+            if file_px > 0:
+                return float(p.get(um2, default)) / (file_px**2)
+            return 0.0 if "min" in str(um2) else 1e9
+
+        def show(win, title: str, attr: str) -> None:
+            win.setWindowTitle(f"{title} - {display_name}")
+            win.resize(370, 560)
+            setattr(self, attr, win)  # keep a strong ref
+            if self._viewer is not None:
+                self._viewer.window.add_dock_widget(
+                    win, name=f"{title}: {display_name}", area="right"
+                )
+            else:
+                win.show()
+
+        # ── Pass 3 callback: measure what survived all three passes ──────────
+        def _finish(para_labels, vac_labels, vac_map, para_decisions):
             from ._host import (
                 assign_to_hosts,
                 assign_vacuoles_to_hosts,
@@ -2590,85 +2642,75 @@ class BatchWidget(QWidget):
                 measure_hosts,
                 measure_vacuoles_in_hosts,
             )
+            from ._measure import measure_pvs
 
-            host_only = bool(item.get("host_only"))
-            hosts = curated_hosts.copy()
-            for hid, dec in decisions.items():
-                if dec == 0:
-                    hosts[hosts == hid] = 0
-            item["host_labels"] = hosts
+            hosts = item["host_labels"]
+            rejected = {pid for pid, d in (para_decisions or {}).items() if d == 0}
+            if rejected and para_labels is not None:
+                para_labels = para_labels.copy()
+                for pid in rejected:
+                    para_labels[para_labels == pid] = 0
+                vac_map = {k: v for k, v in vac_map.items() if k not in rejected}
 
-            # Recompute assignment + measurement against the curated hosts.
-            # Parasites in rejected hosts lose their majority and are dropped.
-            if host_only:
+            if host_only or para_labels is None:
+                para_labels = np.zeros_like(hosts)
+                vac_labels = np.zeros_like(hosts)
+                vac_map = {}
                 para_to_host: dict[int, int] = {}
                 vac_to_host: dict[int, int] = {}
             else:
                 para_to_host, vac_to_host, _dropped = assign_to_hosts(
-                    item["para_labels"], hosts, item.get("vac_map") or None
+                    para_labels, hosts, vac_map or None
                 )
-                _vl = item.get("vac_labels")
-                if _vl is not None and np.asarray(_vl).max() > 0:
-                    # Vacuole count comes from the mask, not from parasites.
-                    vac_direct, _ = assign_vacuoles_to_hosts(_vl, hosts)
+                if vac_labels is not None and vac_labels.max() > 0:
+                    vac_direct, _ = assign_vacuoles_to_hosts(vac_labels, hosts)
                     vac_to_host = {**vac_to_host, **vac_direct}
-            # Channels as captured at run time — never the live spinboxes,
-            # which the user may have retuned for a later run before saving
-            # this (asynchronous) review.
-            ch_cptsa = item.get("ch_cptsa", self._ch_cptsa.value())
-            ch_mcherry = item.get("ch_mcherry", self._ch_mcherry.value())
-            ch_names = {0: "ch0", 1: "ch1"}
-            ch_names[ch_cptsa] = "cptsa"
-            ch_names[ch_mcherry] = "mcherry"
-            file_px = item["file_px"]
+
             hosts_df = measure_hosts(
                 host_labels=hosts,
-                para_labels=item["para_labels"],
+                para_labels=para_labels,
                 image=item["image"],
                 para_to_host=para_to_host,
                 vac_to_host=vac_to_host,
                 dilation_px=self._host_dilation_px.value(),
-                exclude_labels=None if host_only else item.get("vac_labels"),
+                exclude_labels=None if host_only else vac_labels,
                 ch_cptsa=ch_cptsa,
                 ch_mcherry=ch_mcherry,
                 ch_names=ch_names,
-                pixel_size_um=file_px if file_px > 0 else None,
+                pixel_size_um=px_um,
             )
             if host_only:
                 hosts_df = drop_infection_columns(hosts_df)
                 para_df = pd.DataFrame()
             else:
-                from ._measure import measure_pvs
-
-                para_df = measure_pvs(
-                    labels=item["para_labels"],
-                    image=item["image"],
-                    ch_cptsa=ch_cptsa,
-                    ch_mcherry=ch_mcherry,
-                    ch_names=ch_names,
-                    pixel_size_um=file_px if file_px > 0 else None,
-                )
-                if not para_df.empty:
-                    para_df["host_id"] = para_df.index.map(para_to_host)
-                    para_df["vacuole_id"] = para_df.index.map(item.get("vac_map") or {})
-                    para_df = para_df[para_df["host_id"].notna()]
-
-                # Recompute the per-host vacuole summary against curated hosts.
                 vac_df = measure_vacuoles_in_hosts(
-                    vac_labels=item.get("vac_labels"),
-                    para_labels=item["para_labels"],
+                    vac_labels=vac_labels,
+                    para_labels=para_labels,
                     image=item["image"],
                     vac_to_host=vac_to_host,
-                    vacuole_map=item.get("vac_map") or {},
+                    vacuole_map=vac_map,
                     ch_cptsa=ch_cptsa,
                     ch_mcherry=ch_mcherry,
                     ch_names=ch_names,
-                    pixel_size_um=file_px if file_px > 0 else None,
+                    pixel_size_um=px_um,
                 )
                 if not hosts_df.empty:
                     hosts_df = hosts_df.join(
                         host_vacuole_summary(vac_df, list(hosts_df.index))
                     )
+                para_df = measure_pvs(
+                    labels=para_labels,
+                    image=item["image"],
+                    ch_cptsa=ch_cptsa,
+                    ch_mcherry=ch_mcherry,
+                    ch_names=ch_names,
+                    pixel_size_um=px_um,
+                )
+                if not para_df.empty:
+                    para_df["host_id"] = para_df.index.map(para_to_host)
+                    para_df["vacuole_id"] = para_df.index.map(vac_map)
+                    para_df = para_df[para_df["host_id"].notna()]
+
             for df in (hosts_df, para_df):
                 if df is not None and not df.empty:
                     df["file"] = item["file"]
@@ -2677,20 +2719,243 @@ class BatchWidget(QWidget):
                     df["cell_line"] = item["cell_line"]
                     df["replicate"] = item["replicate"]
 
+            item["para_labels"] = para_labels
+            item["vac_labels"] = vac_labels
+            item["vac_map"] = vac_map
             key = (item["file"], item["position_name"])
             self._host_results[key] = {"hosts": hosts_df, "parasites": para_df}
-            self._curation_decisions[key] = dict(decisions)
+            self._curation_decisions[key] = dict(para_decisions or {"_hosts": 1})
             self._update_review_status()
+
+            # Persist the curated masks so a later re-measure reproduces this.
+            try:
+                mask_dir = self._pending_out_folder / "masks"
+                mask_dir.mkdir(parents=True, exist_ok=True)
+                stem = f"{item['file']}_{_safe_filename(item['position_name'])}"
+                save_mask_tiff(hosts, mask_dir / f"{stem}_host_mask.tif")
+                if not host_only:
+                    save_mask_tiff(vac_labels, mask_dir / f"{stem}_host_vac_mask.tif")
+                    save_mask_tiff(para_labels, mask_dir / f"{stem}_host_para_mask.tif")
+            except Exception as exc:
+                self._log_msg(f"Curated mask save skipped: {exc}")
+
+            n_inf = int(hosts_df["infected"].sum()) if "infected" in hosts_df else 0
             self._log_msg(
-                f"Host review saved for {item['display_name']} — "
-                f"{len(hosts_df)} hosts kept."
+                f"Saved {display_name}: {len(hosts_df)} hosts"
+                + ("" if host_only else f", {n_inf} infected, {len(para_df)} parasites")
             )
 
-            # Grow the host classifier's training set from this review — the
-            # same curated_host_features.* files the single-image Host tab
-            # feeds, kept fully separate from the PV classifier.  Features
-            # come from the pre-rejection array so rejected hosts contribute
-            # negative examples.
+        # ── Pass 3: parasites inside the accepted vacuoles ───────────────────
+        def _open_parasites(vac_labels, vac_decisions):
+            from ._segment import segment_parasites_in_vacuoles
+
+            accepted_vac = vac_labels.copy()
+            for vid, dec in (vac_decisions or {}).items():
+                if dec == 0:
+                    accepted_vac[accepted_vac == vid] = 0
+            n_vac = len(np.unique(accepted_vac)) - 1
+            if n_vac == 0:
+                self._log_msg(f"{display_name}: no vacuoles accepted - measuring.")
+                _finish(None, accepted_vac, {}, {})
+                return
+
+            sd_para = None
+            if seg_backend == 1:
+                try:
+                    from ._stardist import load_stardist_model
+
+                    sd_para = load_stardist_model(
+                        Path(annot_dir) / "stardist_model", mode="parasites"
+                    )
+                    self._log_msg(
+                        "Using fine-tuned parasite model."
+                        if sd_para is not None
+                        else "Parasite model not found - using cpSAM."
+                    )
+                except Exception as exc:
+                    self._log_msg(f"Parasite model load failed ({exc}) - using cpSAM.")
+
+            self._log_msg(f"Detecting parasites in {n_vac} vacuole(s)...")
+            para_labels, vac_map = segment_parasites_in_vacuoles(
+                image=item["image"],
+                vac_labels=accepted_vac,
+                seg_channel=p.get("seg_ch", ch_mcherry),
+                model=sd_para,
+                min_area_px=area_px("min_area_um2", 5.0),
+                max_area_px=area_px("max_area_um2", 200.0),
+                max_eccentricity=p.get("max_eccentricity", 0.95),
+                min_solidity=p.get("min_solidity", 0.60),
+                progress_cb=self._log_msg,
+            )
+            n_para = len(np.unique(para_labels)) - 1
+            if n_para == 0:
+                self._log_msg(f"{display_name}: no parasites found - measuring.")
+                _finish(para_labels, accepted_vac, vac_map, {})
+                return
+
+            from ._measure import measure_pvs
+
+            meas = measure_pvs(
+                labels=para_labels,
+                image=item["image"],
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                ch_names=ch_names,
+                pixel_size_um=px_um,
+            )
+            layer = f"{display_name.replace(' ', '_')}_parasites"
+            if self._viewer is not None:
+                if layer in self._viewer.layers:
+                    self._viewer.layers[layer].data = para_labels
+                else:
+                    self._viewer.add_labels(para_labels, name=layer)
+
+            win = CurationWidget(
+                labels=para_labels,
+                image=item["image"],
+                measurements=meas,
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                ch_names=ch_names,
+                pixel_size_um=px_um,
+                vacuole_assignments=vac_map or None,
+                accepted_vac_ids=[int(v) for v in np.unique(accepted_vac) if v != 0],
+                vac_labels=accepted_vac,
+                on_save=lambda dec, va=None: _finish(
+                    para_labels, accepted_vac, va or vac_map, dec
+                ),
+                viewer=self._viewer,
+                labels_layer_name=layer,
+            )
+            show(win, "Parasites (3/3)", "_curation_win3")
+
+        # ── Pass 2: vacuoles inside the accepted hosts ───────────────────────
+        def _open_vacuoles(host_decisions, curated_hosts):
+            from ._segment import filter_labels, segment_pvs
+
+            hosts = curated_hosts.copy()
+            for hid, dec in (host_decisions or {}).items():
+                if dec == 0:
+                    hosts[hosts == hid] = 0
+            item["host_labels"] = hosts
+            n_hosts = len(np.unique(hosts)) - 1
+            self._log_msg(f"Host review saved - {display_name}: {n_hosts} hosts kept.")
+
+            if host_only or n_hosts == 0:
+                _finish(None, None, {}, {})
+                return
+
+            masked = item["image"] * (hosts > 0)[..., np.newaxis].astype(
+                item["image"].dtype
+            )
+            vac_min = area_px("vac_min_area_um2", 20.0)
+            vac_max = area_px("vac_max_area_um2", 2000.0)
+            self._log_msg("Detecting vacuoles inside accepted hosts...")
+            try:
+                if seg_backend == 1:
+                    from ._stardist import load_stardist_model, predict_stardist
+
+                    sd_vac = load_stardist_model(
+                        Path(annot_dir) / "stardist_model", mode="vacuoles"
+                    )
+                    if sd_vac is not None:
+                        self._log_msg("Using fine-tuned vacuole model.")
+                        raw = predict_stardist(
+                            masked, sd_vac, p.get("vac_seg_ch", ch_mcherry)
+                        )
+                        vac_labels, _, _ = filter_labels(
+                            raw,
+                            vac_min,
+                            vac_max,
+                            p.get("max_eccentricity", 0.95),
+                            p.get("min_solidity", 0.60),
+                        )
+                    else:
+                        self._log_msg("Vacuole model not found - using cpSAM.")
+                        vac_labels = None
+                else:
+                    vac_labels = None
+                if vac_labels is None:
+                    vac_labels, _, _ = segment_pvs(
+                        image=masked,
+                        channel_index=p.get("vac_seg_ch", ch_mcherry),
+                        use_composite=p.get("use_composite", False),
+                        min_area_px=vac_min,
+                        max_area_px=vac_max,
+                        max_eccentricity=p.get("max_eccentricity", 0.95),
+                        min_solidity=p.get("min_solidity", 0.60),
+                        diameter=None,
+                        flow_threshold=p.get("flow_threshold", 0.4),
+                        cellprob_threshold=p.get("cellprob_threshold", 0.0),
+                        threshold_method=p.get("threshold_method", "none"),
+                        threshold_channel=p.get("threshold_channel", ch_mcherry),
+                        threshold_value=p.get("threshold_value", 0.0),
+                        threshold_percentile=p.get("threshold_percentile", 50.0),
+                    )
+            except Exception as exc:
+                self._log_msg(f"Vacuole detection failed: {exc}")
+                _finish(None, None, {}, {})
+                return
+
+            n_vac = len(np.unique(vac_labels)) - 1
+            self._log_msg(f"{n_vac} vacuole(s) detected in {n_hosts} host(s).")
+            if n_vac == 0:
+                _finish(None, vac_labels, {}, {})
+                return
+
+            layer = f"{display_name.replace(' ', '_')}_vacuoles"
+            if self._viewer is not None:
+                if layer in self._viewer.layers:
+                    self._viewer.layers[layer].data = vac_labels
+                else:
+                    self._viewer.add_labels(vac_labels, name=layer)
+
+            win = VacuoleCurationWidget(
+                vac_labels=vac_labels,
+                image=item["image"],
+                ch_cptsa=ch_cptsa,
+                ch_mcherry=ch_mcherry,
+                on_save=lambda dec, lbl: QTimer.singleShot(
+                    0, lambda d=dec, k=lbl: _open_parasites(k, d)
+                ),
+                viewer=self._viewer,
+                labels_layer_name=layer,
+                object_name="vacuole",
+            )
+            show(win, "Vacuoles (2/3)", "_curation_win2")
+
+        # ── Pass 1: hosts ────────────────────────────────────────────────────
+        host_layer = f"{display_name.replace(' ', '_')}_hosts"
+        if self._viewer is not None:
+            img = item["image"]
+            img_chw = np.moveaxis(img, -1, 0) if img.ndim == 3 else img
+            img_layer = f"{display_name.replace(' ', '_')}_image"
+            if img_layer in self._viewer.layers:
+                self._viewer.layers[img_layer].data = img_chw
+            else:
+                self._viewer.add_image(img_chw, name=img_layer, channel_axis=0)
+            if host_layer in self._viewer.layers:
+                self._viewer.layers[host_layer].data = item["host_labels"]
+            else:
+                self._viewer.add_labels(item["host_labels"], name=host_layer)
+            self._viewer.reset_view()
+
+        win = VacuoleCurationWidget(
+            vac_labels=item["host_labels"],
+            image=item["image"],
+            ch_cptsa=ch_cptsa,
+            ch_mcherry=ch_mcherry,
+            on_save=lambda dec, lbl: QTimer.singleShot(
+                0, lambda d=dec, k=lbl: _host_saved(d, k)
+            ),
+            viewer=self._viewer,
+            labels_layer_name=host_layer,
+            object_name="host cell",
+        )
+
+        def _host_saved(decisions, curated_hosts):
+            # Grow the host classifier's training set from this review, then
+            # move on to vacuole detection inside the accepted hosts.
             try:
                 from ._io import append_curated_annotations
                 from ._learning import extract_features, train_classifier
@@ -2703,40 +2968,25 @@ class BatchWidget(QWidget):
                     ch_mcherry=ch_mcherry,
                     ch_names=ch_names,
                 )
-                host_stem = (
-                    f"{item['file']}_{_safe_filename(item['position_name'])}_host"
-                )
                 csv_path = append_curated_annotations(
                     decisions=decisions,
                     features=feats,
-                    image_stem=host_stem,
+                    image_stem=(
+                        f"{item['file']}_{_safe_filename(item['position_name'])}_host"
+                    ),
                     annotations_dir=self._annot_dir.text(),
                     csv_name="curated_host_features.csv",
                 )
                 n_dec = sum(1 for v in decisions.values() if v in (0, 1))
-                self._log_msg(f"Saved {n_dec} host annotations → {csv_path}")
+                self._log_msg(f"Saved {n_dec} host annotations -> {csv_path}")
                 if train_classifier(csv_path) is not None:
                     self._log_msg("Host classifier retrained.")
-                else:
-                    self._log_msg("Not enough host data to train the classifier yet.")
                 self._try_load_classifier()
             except Exception as exc:
                 self._log_msg(f"Host annotation save error: {exc}")
+            _open_vacuoles(decisions, curated_hosts)
 
-        self._host_curation_win = VacuoleCurationWidget(
-            vac_labels=item["host_labels"],
-            image=item["image"],
-            ch_cptsa=self._ch_cptsa.value(),
-            ch_mcherry=self._ch_mcherry.value(),
-            on_save=_on_save,
-            viewer=self._viewer,
-            labels_layer_name=None,
-            object_name="host cell",
-            parent=None,
-        )
-        self._host_curation_win.setWindowTitle(f"Host Review — {item['display_name']}")
-        self._host_curation_win.resize(360, 560)
-        self._host_curation_win.show()
+        show(win, "Host cells (1/3)", "_host_curation_win")
 
     def _save_accepted_results(self):
         """Write results.csv from measurements accumulated during curation."""
