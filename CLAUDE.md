@@ -75,6 +75,10 @@ _host.py     ← Host-cell segmentation and infection analysis (see "Host analys
                measure_hosts()            per-host cytosol (host minus dilated
                                            parasites) Peredox ratio + infection
                                            metadata columns (Stage H3)
+               vacuoles_from_parasites()  group parasite masks into vacuoles
+                                           (dilate/connect/fill) — vacuoles are
+                                           never segmented standalone; see
+                                           "Curation order" below
                drop_infection_columns()   strip INFECTION_COLS from a hosts
                                            table — used by host-only mode so
                                            "never checked" ≠ "uninfected"
@@ -182,6 +186,32 @@ shown (`_update_mode_visibility()`):
 | Parasite / vacuole segmentation | shown | shown | hidden |
 | Morphology filters | shown | shown | hidden |
 | Host mode settings | hidden | shown | shown |
+
+**Curation order (batch host modes).** The worker runs **Stage H1 only** —
+it segments hosts, applies the host classifier, saves the host mask and hands
+the position to curation. Each position is then reviewed as a three-pass
+chain, every stage detected inside what the previous stage accepted:
+
+| Pass | What | Detected from |
+|---|---|---|
+| 1/3 hosts | accept/reject/redraw; feeds `curated_host_features.csv` | cpSAM on the clipped host channel |
+| 2/3 parasites | per-vacuole gallery | image masked to **accepted hosts**; fine-tuned parasite model when StarDist is selected, else cpSAM |
+| 3/3 vacuoles | accept/reject; rejecting one drops its parasites | **grouped from the accepted parasites** (`_host.vacuoles_from_parasites`) |
+
+Measurement runs after pass 3, so saved rows describe exactly what was
+accepted, and the curated masks are written back for later re-measures.
+Because measurement follows review, **unreviewed positions contribute no
+rows**.
+
+**Vacuoles are never segmented on their own.** Standalone cpSAM vacuole
+detection on host-masked Peredox images returns host **nuclei** — once the
+image is masked to hosts, nuclei are the roundest high-contrast objects, and
+at ~150–250 µm² they pass the 20–2000 µm² Stage-1 gate. Measured on real
+data: only ~half of parasites landed inside a detected "vacuole" and two
+thirds of detections held no parasite at all. Parasites are unambiguous, so
+they are detected first and vacuoles are recovered by dilating/connecting/
+filling them — the same reasoning `_segment.group_by_vacuole()` and
+`_io._build_vacuole_mask()` already use for PV mode.
 
 In both host modes, `_BatchWorker._process_host_position()` runs
 automatically for every position; the host classifier (when trained)

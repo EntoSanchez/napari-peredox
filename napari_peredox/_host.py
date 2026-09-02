@@ -508,3 +508,69 @@ def host_vacuole_summary(
     out["max_parasites_per_vacuole"] = out["max_parasites_per_vacuole"].fillna(0)
     out["n_vacuoles_with_parasites"] = out["n_vacuoles_with_parasites"].fillna(0)
     return out
+
+
+def vacuoles_from_parasites(
+    para_labels: np.ndarray,
+    dilation_px: int = 5,
+) -> tuple[np.ndarray, dict[int, int]]:
+    """
+    Group parasite masks into vacuoles: dilate, connect, fill.
+
+    Standalone cpSAM vacuole detection is unreliable on host-expressing
+    Peredox images — once the image is masked to hosts, the roundest
+    high-contrast objects are host **nuclei**, and that is what the model
+    returns (measured: only ~half of parasites landed inside a detected
+    "vacuole", and two thirds of detections contained no parasite at all).
+
+    Parasites, by contrast, are unambiguous, and parasites sharing a vacuole
+    are physically adjacent — so the vacuole is recovered by dilating the
+    parasite masks, taking connected components and filling the enclosed
+    lumen.  This is the same reasoning `_segment.group_by_vacuole()` and
+    `_io._build_vacuole_mask()` already use for PV mode.
+
+    Parameters
+    ----------
+    para_labels : np.ndarray (H, W) int32
+        Per-parasite label image (0 = background).
+    dilation_px : int
+        Half the largest gap to bridge between parasites of one vacuole.
+
+    Returns
+    -------
+    vac_labels : np.ndarray (H, W) int32
+        Vacuole label image, ids consecutive from 1.
+    vacuole_map : dict {parasite_label → vacuole_id}
+    """
+    from scipy.ndimage import binary_fill_holes
+    from skimage.measure import label as sk_label
+    from skimage.measure import regionprops
+    from skimage.morphology import dilation, disk
+
+    vac_labels = np.zeros_like(para_labels, dtype=np.int32)
+    vacuole_map: dict[int, int] = {}
+    if para_labels is None or para_labels.max() == 0:
+        return vac_labels, vacuole_map
+
+    grown = dilation(para_labels > 0, disk(dilation_px))
+    groups = sk_label(binary_fill_holes(grown), connectivity=2)
+
+    next_id = 0
+    for gid in np.unique(groups):
+        if gid == 0:
+            continue
+        region = groups == gid
+        members = [int(v) for v in np.unique(para_labels[region]) if v != 0]
+        if not members:
+            continue  # dilation artefact enclosing no parasite
+        next_id += 1
+        vac_labels[region] = next_id
+        for pid in members:
+            vacuole_map[pid] = next_id
+
+    # A parasite pixel must never sit outside its own vacuole.
+    for rp in regionprops(para_labels):
+        vid = vacuole_map.get(int(rp.label))
+        if vid is not None:
+            vac_labels[para_labels == rp.label] = vid
+    return vac_labels, vacuole_map

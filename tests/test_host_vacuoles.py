@@ -234,3 +234,53 @@ def test_empty_vacuole_counted_and_measured():
     s = host_vacuole_summary(vdf, host_ids=[1])
     assert s.loc[1, "vacuole_area_px_total"] == 128.0  # both vacuoles
     assert int(s.loc[1, "n_vacuoles_with_parasites"]) == 1
+
+
+# ── Deriving vacuoles from parasite masks ────────────────────────────────────
+
+
+def test_vacuoles_from_parasites_groups_adjacent_bodies():
+    from napari_peredox._host import vacuoles_from_parasites
+
+    para = np.zeros((60, 60), dtype=np.int32)
+    para[10:14, 10:14] = 1  # these two are adjacent -> one vacuole
+    para[10:14, 15:19] = 2
+    para[40:44, 40:44] = 3  # far away -> its own vacuole
+    vac, vac_map = vacuoles_from_parasites(para, dilation_px=5)
+    assert len(set(vac_map.values())) == 2
+    assert vac_map[1] == vac_map[2]
+    assert vac_map[3] != vac_map[1]
+    # Every parasite pixel lies inside its vacuole
+    for pid, vid in vac_map.items():
+        assert (vac[para == pid] == vid).all()
+
+
+def test_vacuoles_from_parasites_fills_the_lumen_between_bodies():
+    from napari_peredox._host import vacuoles_from_parasites
+
+    para = np.zeros((40, 40), dtype=np.int32)
+    para[10:14, 10:14] = 1
+    para[10:14, 16:20] = 2
+    vac, _ = vacuoles_from_parasites(para, dilation_px=5)
+    # The gap between the two bodies belongs to the vacuole
+    assert vac[11, 15] != 0
+
+
+def test_vacuoles_from_parasites_empty_input():
+    from napari_peredox._host import vacuoles_from_parasites
+
+    vac, vac_map = vacuoles_from_parasites(np.zeros((20, 20), dtype=np.int32))
+    assert vac.max() == 0
+    assert vac_map == {}
+
+
+def test_vacuoles_from_parasites_ids_are_consecutive():
+    from napari_peredox._host import vacuoles_from_parasites
+
+    para = np.zeros((80, 80), dtype=np.int32)
+    para[5:9, 5:9] = 7  # non-consecutive parasite ids
+    para[30:34, 30:34] = 12
+    para[60:64, 60:64] = 3
+    vac, vac_map = vacuoles_from_parasites(para, dilation_px=3)
+    assert sorted(set(vac_map.values())) == [1, 2, 3]
+    assert sorted(int(v) for v in np.unique(vac) if v) == [1, 2, 3]
