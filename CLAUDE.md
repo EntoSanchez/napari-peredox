@@ -316,7 +316,8 @@ verified by running it on real images (spec §8 acceptance test).
 uv run pytest tests/ -v
 ```
 
-36 tests, all passing as of 2026-08-26.
+52 tests, all passing as of 2026-10-07. They cover pure array/DataFrame
+logic only -- no Qt/UI coverage (see NOTES.md, "Needs improvement").
 
 ---
 
@@ -357,14 +358,19 @@ uv run pytest tests/ -v
 
 ---
 
-## State of the project as of 2026-08-25
+## State of the project as of 2026-10-07
+
+Recent changes and the current list of known gaps live in
+[`NOTES.md`](NOTES.md) -- read that first.
+
+### Earlier snapshot (2026-08-25)
 
 - **All core modules written**: `_segment.py`, `_measure.py`, `_learning.py`, `_curation.py`, `_io.py`, `_widget.py`, `_batch.py`, `_host.py`
 - **Dependencies installed**: all packages including cellSAM and nd2 installed in `.venv` (Python 3.11)
 - **Imports verified**: all modules import cleanly from the venv, including `_host` (`_widget`, `_batch`, `_curation`, `_host`)
 - **Host-cell analysis mode added** (`host-analysis` branch, spec
   `docs/superpowers/specs/2026-08-25-host-analysis-design.md`): see "Host
-  analysis workflow" above. `tests/` added (pytest; 36 tests passing as of the three-mode update).
+  analysis workflow" above. `tests/` added (pytest).
   Not yet run against real U2OS Peredox images end-to-end (spec §8
   acceptance test — cpSAM segmentation quality on real data — is pending
   manual verification).

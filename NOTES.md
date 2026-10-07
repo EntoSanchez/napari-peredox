@@ -1,188 +1,204 @@
-# napari-peredox — Project Notes
+# napari-peredox — status notes
 
-## What this project is
+Repo-level status: what changed recently and what still needs work.
+Script-specific notes live in [`scripts/NOTES.md`](scripts/NOTES.md); the
+architecture reference is [`CLAUDE.md`](CLAUDE.md).
 
-Peredox is a genetically encoded, ratiometric NADH sensor composed of two fluorescent proteins:
-- **cpTSapphire** — circularly permuted T-Sapphire, a cyan/green FP whose emission changes with the NADH/NAD⁺ ratio
-- **mCherry** — red FP used as a ratiometric reference (insensitive to redox state)
-
-The ratio **cpTSapphire / mCherry** (integrated density or mean intensity) reports the relative NADH level inside each parasitophorous vacuole (PV). Higher ratio = more reduced environment.
-
-This plugin:
-1. Uses **cellSAM** to segment individual PVs in 2D fluorescence images
-2. Measures fluorescence intensities inside each segment
-3. Lets the user curate (accept/reject) segments to remove false positives
-4. **Learns from curation over time**: accepted/rejected examples train a lightweight
-   RandomForest classifier that pre-filters segments in future sessions
+**As of 2026-10-07** — pushed through `527222f`. 52 tests passing, ruff clean,
+all modules import. The host-cell analysis mode is feature-complete in code but
+**the batch three-pass curation chain has not yet been run inside napari**.
 
 ---
 
-## Measurement definitions
+## Recent changes (2026-08-25 → 2026-09-02)
 
-| Term | Formula | Fiji equivalent |
-|------|---------|-----------------|
-| `mean_<ch>` | Σ pixels / N pixels | Mean |
-| `intden_<ch>` | Σ pixel values in mask | RawIntDen |
-| `ratio_cptsa_mcherry` | `intden_cptsa / intden_mcherry` | — |
+### 1. Host-cell analysis mode (new)
 
-**Note**: `intden_cptsa / intden_mcherry` equals `mean_cptsa / mean_mcherry` because area cancels, but `intden` is preserved for compatibility with Fiji workflows.
+Second analysis pipeline alongside the original PV one: segment U2OS host cells
+expressing cytosolic Peredox, find parasites inside them, and report per-host
+Peredox ratio with infection status. Design:
+[`docs/superpowers/specs/2026-08-25-host-analysis-design.md`](docs/superpowers/specs/2026-08-25-host-analysis-design.md).
 
----
+- New module `_host.py`: `clip_bright`, `segment_host_cells`, `assign_to_hosts`,
+  `assign_vacuoles_to_hosts`, `measure_hosts`, `measure_vacuoles_in_hosts`,
+  `host_vacuole_summary`, `vacuoles_from_parasites`, `drop_infection_columns`.
+- Single-image **Host tab** (4th tab) and batch host modes.
+- Host classifier kept **entirely separate** from the PV one
+  (`curated_host_features.csv` / `.joblib`); batch host review now feeds and
+  retrains it, and its status is shown in both widgets.
 
-## Channel assignment
+### 2. Three analysis modes
 
-Typical Peredox experiment image:
-- Channel 0: cpTSapphire (excitation ~405 nm, emission ~512 nm)
-- Channel 1: mCherry (excitation ~587 nm, emission ~610 nm)
-- Channel 2+ (optional): DAPI, brightfield, etc.
+Selector moved to the **top of the batch Channels tab**, with only the relevant
+setting groups visible per mode:
 
-Adjust channel spinboxes in the Setup panel to match your acquisition.
+| Mode | Hosts | Parasites |
+|---|---|---|
+| Parasites / PVs | — | original two-stage pipeline |
+| Host cells + parasites | segmented + curated | detected inside accepted hosts |
+| Host cells only | segmented + curated | never looked for |
 
----
+Host-only exports **drop** the infection columns (`_host.INFECTION_COLS`) so
+"never checked" can't be misread as "verified uninfected".
 
-## Segmentation approach
+### 3. Curation order inverted — hosts first, vacuoles last
 
-cellSAM (Segment Anything for Cells) is a SAM-based model fine-tuned for cell/organelle segmentation. It is run on a single channel or the channel-wise maximum projection (controlled by the "Use composite" checkbox in the UI).
+The batch worker now runs **Stage H1 only**; each position is reviewed as a
+three-pass chain, each stage detected inside what the previous one accepted:
 
-**Good choices for the segmentation channel:**
-- cpTSapphire: usually gives good contrast for PVs
-- Max composite: useful if neither channel alone shows all PVs clearly
+1. **hosts** → 2. **parasites** (inside accepted hosts) → 3. **vacuoles**
+(grouped from accepted parasites; rejecting one drops its parasites)
 
-After cellSAM, segments are filtered by area (configurable min/max).
+Measurement runs after pass 3, so saved rows describe exactly what was accepted,
+and curated masks are written back.
 
----
+**Vacuoles are never segmented standalone.** cpSAM on a host-masked image
+returns host **nuclei** — once masked to hosts they're the roundest
+high-contrast objects, and at ~150–250 µm² they pass the 20–2000 µm² gate.
+Measured: only ~half of parasites fell inside a detected "vacuole" and two
+thirds of detections held no parasite. Parasites are unambiguous, so they go
+first and vacuoles are recovered by dilate → connect → fill
+(`_host.vacuoles_from_parasites`).
 
-## Active learning / classifier
+Fine-tuned **StarDist models are now wired into host mode** (previously
+hardcoded `model=None` with a "not supported in batch host mode" notice).
 
-After each curation session, accepted (true PV) and rejected (false positive) segments are saved to `annotations/curated_features.csv`. The features stored per segment are:
+### 4. Vacuole reporting folded into `hosts.csv`
 
-| Feature | Description |
-|---------|-------------|
-| `area_px` | Segment area in pixels |
-| `eccentricity` | 0=circle, 1=line |
-| `solidity` | area / convex_hull_area |
-| `extent` | area / bounding_box_area |
-| `perimeter` | Segment perimeter |
-| `mean_intensity_seg_ch` | Mean intensity on segmentation channel |
-| `std_intensity_seg_ch` | Std dev of intensity on segmentation channel |
-| `mean_cptsa` | Mean cpTSapphire intensity |
-| `mean_mcherry` | Mean mCherry intensity |
-| `intden_cptsa` | Integrated density cpTSapphire |
-| `intden_mcherry` | Integrated density mCherry |
-| `ratio_cptsa_mcherry` | cpTSapphire / mCherry ratio |
+Per your call, no separate vacuole table — `hosts.csv` gained
+`mean_parasites_per_vacuole`, `max_parasites_per_vacuole`,
+`vacuole_area_px_total`, `vacuole_area_um2_total`, `mean_vacuole_area_px`,
+`mean_vacuole_ratio_intden`, `median_vacuole_ratio_intden`,
+`mean_parasite_ratio`, `median_parasite_ratio`, `n_vacuoles_with_parasites`,
+`excluded_area_px`. `host_parasites.csv` gained `vacuole_id`.
 
-A `RandomForestClassifier` (100 trees, max_depth=8, balanced class weights) is trained on these features. From the **second session onwards**, the classifier is loaded automatically and false positives are filtered before the curation panel opens, reducing manual review load.
+Two correctness fixes alongside:
+- **Host cytosol now excludes the whole vacuole mask**, not just parasite
+  bodies — mCherry fills the PV lumen, so inter-parasite space was leaking
+  parasite signal into host ratios.
+- **`n_vacuoles` counts from the vacuole mask directly.** It previously saw
+  vacuoles only through their member parasites, so a vacuole whose parasites
+  weren't resolved went uncounted.
 
-The classifier requires **≥ 10 annotated examples with at least one of each class** before it will train. The status panel in the widget shows current counts.
+### 5. Re-measure without re-segmenting
 
----
+- Batch checkbox **"Re-measure: reuse saved masks (skip segmentation)"**.
+- [`scripts/remeasure_host_run.py`](scripts/remeasure_host_run.py) — scriptable
+  equivalent, with `--curated-from` to preserve review decisions (saved masks
+  are written *before* curation, so a naive re-measure resurrects rejected
+  hosts — it silently re-added 8 and 5 hosts in the two KO arms).
+- [`scripts/backfill_vacuole_masks.py`](scripts/backfill_vacuole_masks.py) —
+  adds missing vacuole masks to old runs (`--from-parasites` is the mode to
+  use).
+- [`scripts/check_vacuole_masks.py`](scripts/check_vacuole_masks.py) — QC:
+  what fraction of parasites sit inside a vacuole, how many vacuoles are empty.
+  **Always run after a backfill.**
 
-## Batch processing (ND2 files)
+### 6. Tuned segmentation defaults (from a real-data sweep)
 
-Use **Plugins → Peredox: Batch Process ND2 Files** to analyse entire experiments.
+[`scripts/host_param_sweep.py`](scripts/host_param_sweep.py) established that
+**cpSAM auto-diameter is unusable** on dim Peredox images (it shatters cells
+into ~1 µm² speckle — this was the "only segmenting nuclei" report). Defaults
+now: host diameter **300 px**, min host area **350 µm²** (above a U2OS nucleus),
+clip percentile 99.
 
-The batch widget accepts one or more ND2 files and iterates over every XY stage
-position in each file.  For each position it runs the full pipeline
-(segmentation → classifier filter → measurement) and appends results to a single
-CSV.  You choose an **output folder** (not just a CSV path); all outputs go there.
+### 7. Downstream analysis
 
-**Metadata fields** (written as columns in the CSV):
-
-| Field | Example | Notes |
-|-------|---------|-------|
-| Treatment | "DMSO", "compound_X" | Free text |
-| Cell line | "HFF", "RH" | Free text |
-| Replicate # | 1, 2, 3 | Integer spinner |
-
-**Output folder layout**:
-
-```
-<out_folder>/
-├── results.csv          one row per PV, all conditions combined
-└── mips/
-    ├── file1_pos000_MIP.tif
-    ├── file1_pos001_MIP.tif
-    └── ...
-```
-
-**Output CSV columns** (one row per PV):
-
-```
-file, position_index, position_name,
-treatment, cell_line, replicate,
-pv_label, centroid_y, centroid_x,
-area_px, [area_um2],
-mean_cptsa, intden_cptsa,
-mean_mcherry, intden_mcherry,
-ratio_cptsa_mcherry
-```
-
-**MIP TIFFs**: saved as (C, H, W) float32, `imagej=True` for Fiji compatibility.
-Each position's MIP is saved immediately after reading — before segmentation —
-so partial runs leave behind usable images even if processing is interrupted.
-
-**Appending behaviour**: if `results.csv` already exists, new rows are appended
-rather than overwriting. This lets you process multiple experimental conditions
-into a single file by running batch with different metadata for each set of ND2 files.
-
-**ND2 dimension handling**: the `nd2` library reads multi-position acquisitions
-where each XY point is one 'P' frame. Z-stacks are max-projected along Z before
-segmentation. Position names from the microscope stage log are preserved; if
-names are unavailable they fall back to `pos000`, `pos001`, etc.
+[`D:\Lourido Lab\figures\UZS01_range_peredox\`](../figures/UZS01_range_peredox/)
+— own uv project: master + seeded random-50-per-replicate datasets, ANOVA/Tukey
+at **both** cell and replicate-mean level, violin+beeswarm figures in three
+themes, plus a by-replicate variant. Result: pyruvate lowers the ratio ~0.23
+(robust at both levels); lactate and oligomycin are indistinguishable from
+vehicle.
 
 ---
 
-## File layout
+## Needs improvement
 
-```
-napari-peredox/
-├── napari_peredox/          Python package (the plugin)
-│   ├── __init__.py
-│   ├── napari.yaml          napari entry points
-│   ├── _widget.py           Main dock widget (single image)
-│   ├── _batch.py            Batch widget + ND2 reader
-│   ├── _segment.py          cellSAM wrapper
-│   ├── _measure.py          Fluorescence measurements
-│   ├── _curation.py         Accept/reject UI
-│   ├── _learning.py         Feature extraction + classifier training
-│   └── _io.py               Persistence (CSV, TIFF)
-├── annotations/             Created automatically on first run
-│   ├── curated_features.csv Grows each session
-│   ├── curated_features.joblib  Trained classifier
-│   └── results/             Per-image measurement CSVs + label TIFFs
-├── pyproject.toml           uv project config + dependencies
-├── uv.lock                  Pinned dependency versions
-├── NOTES.md                 This file
-└── CLAUDE.md                Developer notes for Claude Code
-```
+Roughly in priority order.
+
+### High — correctness / blocking
+
+1. **The three-pass curation chain has never been run in napari.** Ruff, imports
+   and 52 tests pass, but none of them exercise Qt callbacks. An adversarial
+   review was started and interrupted. Most-likely failure points: curation
+   widget callback signatures, closure capture in the pass-to-pass handoffs,
+   and widget garbage collection mid-chain. **Trial-run one position before a
+   real batch.**
+
+2. **The PV RandomForest classifier is inert.** `self._classifier` is loaded,
+   trained and displayed, but `apply_classifier_filter` is only ever called for
+   *hosts*. In `_widget.py` the `_use_classifier` checkbox is created and never
+   read; in `_batch.py` it's put into params (line ~1973) and never consumed.
+   The 85 MB `curated_features.joblib` has never filtered anything. Either wire
+   it up or remove the checkboxes — right now they silently lie.
+
+3. **The 20260824 infection data needs re-running through the new flow.** Its
+   parasite masks came from the old vacuole-first order and badly
+   under-detected: on re-test, pos009 went 10 → **40** parasites and pos020
+   0 → **18**. The infection counts in the current CSVs (18 and 22 hosts) are
+   almost certainly too low. Channels and curation in those files are correct;
+   the parasite detection is not.
+
+### Medium — scientific interpretation
+
+4. **The vacuole "lumen" is an approximation.** `vacuoles_from_parasites` gives
+   a tight envelope around the rosette (dilate 5 px + fill), so
+   `mean_vacuole_ratio_intden` is a rosette-plus-margin ratio, not a true
+   full-lumen ratio. A genuine lumen measurement needs a PV-specific marker
+   channel (GRA, or the 640 IMC1-Halo channel) rather than mCherry.
+
+5. **Dim / low-expressing host cells are never segmented.** Visible in the
+   parameter sweep — faint cells go undetected at every setting. That's a
+   systematic exclusion of low expressers and may bias the ratio distribution.
+   Decide whether it's intentional (unreliable signal) or needs fixing.
+
+6. **`infected` is defined by parasites, not vacuoles.** Now that vacuoles are
+   counted independently, a host can in principle show `n_vacuoles > 0` with
+   `infected = False`. Harmless today (vacuoles are derived from parasites) but
+   worth revisiting if vacuole detection ever becomes independent again.
+
+7. **Unreviewed batch positions contribute no rows.** Inherent to the new order
+   — detection can't precede the curation it depends on — but it means a batch
+   run is only as complete as the review. The log says so on completion.
+
+### Low — ergonomics / robustness
+
+8. **`host_id` and `vacuole_id` are per-position, not global.** Any analysis
+   must group on `(position, host_id)`. Easy to get silently wrong; consider
+   emitting a globally unique key.
+
+9. **The helper scripts assume doubled mask filenames.** Masks are named
+   `{file_stem}_{safe_pos}_host_mask.tif`; for a TIFF-folder source both halves
+   are identical, and `remeasure_host_run.py` / `backfill_vacuole_masks.py`
+   recover the stem with `stem[:len(stem)//2]`. **That heuristic breaks for
+   ND2-sourced runs**, where the two halves differ. Needs a real stem↔image
+   mapping (e.g. a manifest written at run time).
+
+10. **The worker's first host mask is still saved pre-curation.** The three-pass
+    flow now writes curated masks at finish, but the initial one is not, so a
+    re-measure that skips `--curated-from` can still pick up the uncurated
+    version.
+
+11. **GPU VRAM contention makes batches crawl.** The 6 GB card is shared; a
+    long-running napari session holding ~3.4 GB left a backfill ~300 MB of
+    headroom and slowed it dramatically (the earlier "stuck on one file"
+    report). Close other GPU apps before long runs; consider logging free VRAM
+    at batch start.
+
+12. **No UI test coverage at all.** The 52 tests cover pure array/DataFrame
+    logic only. A headless-Qt smoke test of the curation chain would have
+    caught the ordering bug before it reached real data.
 
 ---
 
-## Environment
+## Reproducibility pointers
 
-- **Python**: 3.11
-- **Package manager**: uv (`uv add <pkg>` to add dependencies, never pip)
-- **Activate venv**: `source .venv/Scripts/activate` (Git Bash on Windows)
-- **cellSAM**: installed from `git+https://github.com/vanvalenlab/cellSAM.git`
-- **Linter**: ruff (`uv run ruff check --fix && uv run ruff format`)
-
----
-
-## Running the plugin
-
-```powershell
-# In PowerShell from d:/Lourido Lab/napari-peredox/
-.\.venv\Scripts\Activate.ps1
-napari
-# Single image:  Plugins → Peredox: Segment & Measure PVs
-# Batch ND2:     Plugins → Peredox: Batch Process ND2 Files
-```
-
----
-
-## Key decisions & rationale
-
-- **cellSAM over StarDist/Cellpose**: cellSAM requires no training data and handles irregular PV shapes better than StarDist (which is tuned for round nuclei). Cellpose also works but cellSAM is simpler to set up for this use case.
-- **Post-hoc classifier over fine-tuning SAM**: SAM fine-tuning requires a GPU and many annotated masks (>50). A feature-based RF classifier needs ~10 examples, trains in <1 second, and is transparent (feature importances are inspectable).
-- **Integrated density for ratio**: Matches the "RawIntDen" column used in Fiji ImageJ, making comparisons to legacy measurements straightforward.
-- **Background thread for segmentation**: cellSAM (especially model download + inference) can take 10–60 seconds. Running in a QThread keeps the napari UI responsive.
+| What | Where |
+|---|---|
+| Architecture + workflow reference | [`CLAUDE.md`](CLAUDE.md) |
+| Host-mode design spec | [`docs/superpowers/specs/2026-08-25-host-analysis-design.md`](docs/superpowers/specs/2026-08-25-host-analysis-design.md) |
+| Implementation plan | [`docs/superpowers/plans/2026-08-25-host-analysis.md`](docs/superpowers/plans/2026-08-25-host-analysis.md) |
+| Script usage + real-data findings | [`scripts/NOTES.md`](scripts/NOTES.md) |
+| Downstream figures | `D:\Lourido Lab\figures\UZS01_range_peredox\` |
+| Tests | `uv run pytest tests/ -v` (52) |
